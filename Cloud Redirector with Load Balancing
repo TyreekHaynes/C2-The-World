@@ -1,0 +1,245 @@
+# cloud_redirector.py
+"""
+Multi-cloud redirector with load balancing capabilities
+Acts as first layer of defense and traffic distribution
+"""
+
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import logging
+import json
+import random
+import time
+from datetime import datetime
+import hashlib
+from typing import Dict, List, Optional
+import asyncio
+from contextlib import asynccontextmanager
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class CloudRedirector:
+    """Cloud-based redirector with load balancing"""
+    
+    def __init__(self, redirector_id: str, config: Dict):
+        self.redirector_id = redirector_id
+        self.config = config
+        self.backend_servers = config.get('backend_servers', [])
+        self.active_backends = []
+        self.request_count = 0
+        self.blocked_ips = set()
+        
+        # Cloud provider mimicry
+        self.cloud_provider = config.get('cloud_provider', 'AWS')
+        self.cloud_headers = self._get_cloud_headers()
+        
+        # Load balancing algorithm
+        self.lb_algorithm = config.get('lb_algorithm', 'round_robin')
+        self.current_backend_index = 0
+        
+        # Initialize FastAPI app
+        self.app = FastAPI(title=f"Cloud Redirector {redirector_id}")
+        self._setup_middleware()
+        self._setup_routes()
+    
+    def _get_cloud_headers(self) -> Dict:
+        """Get headers to mimic specific cloud provider"""
+        if self.cloud_provider == 'AWS':
+            return {
+                "Server": "AmazonS3",
+                "X-Amz-Id-2": lambda: hashlib.sha256(str(time.time()).encode()).hexdigest(),
+                "X-Amz-Request-Id": lambda: hashlib.sha256(str(random.random()).encode()).hexdigest()[:20]
+            }
+        elif self.cloud_provider == 'Azure':
+            return {
+                "Server": "Microsoft-IIS/10.0",
+                "X-Powered-By": "ASP.NET",
+                "X-AspNet-Version": "4.0.30319"
+            }
+        elif self.cloud_provider == 'Google':
+            return {
+                "Server": "gws",
+                "X-Cloud-Trace-Context": lambda: f"{random.getrandbits(64)}/000000000000000000000000"
+            }
+        else:  # Cloudflare
+            return {
+                "Server": "cloudflare",
+                "CF-RAY": lambda: f"{random.getrandbits(48):012x}-DFW"
+            }
+    
+    def _setup_middleware(self):
+        """Setup FastAPI middleware"""
+        # CORS - Allow all for redirector
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    
+    def _setup_routes(self):
+        """Setup redirector routes"""
+        
+        @self.app.middleware("http")
+        async def redirector_middleware(request: Request, call_next):
+            """Main redirector middleware"""
+            # Check if IP is blocked
+            client_ip = request.client.host
+            if client_ip in self.blocked_ips:
+                return Response(
+                    content=json.dumps({"error": "Access denied"}),
+                    status_code=403,
+                    headers={"Server": "nginx"}
+                )
+            
+            # Choose backend server
+            backend = self.select_backend(request)
+            if not backend:
+                return Response(
+                    content=json.dumps({"error": "No backend available"}),
+                    status_code=502,
+                    headers={"Server": "nginx"}
+                )
+            
+            # Log request
+            self.request_count += 1
+            logger.info(f"[{self.redirector_id}] {client_ip} -> {backend['host']}:{backend['port']} {request.method} {request.url.path}")
+            
+            # Forward request to backend
+            return await self.forward_request(request, backend)
+        
+        @self.app.get("/health")
+        async def health_check():
+            """Health check endpoint"""
+            return {
+                "status": "healthy",
+                "redirector_id": self.redirector_id,
+                "cloud_provider": self.cloud_provider,
+                "active_backends": len(self.active_backends),
+                "total_requests": self.request_count,
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        @self.app.post("/admin/block_ip/{ip_address}")
+        async def block_ip(ip_address: str):
+            """Admin endpoint to block IP"""
+            self.blocked_ips.add(ip_address)
+            return {"status": "blocked", "ip": ip_address}
+    
+    def select_backend(self, request: Request) -> Optional[Dict]:
+        """Select backend server based on load balancing algorithm"""
+        if not self.active_backends:
+            # Fallback to all backends if none marked active
+            available = self.backend_servers
+        else:
+            available = self.active_backends
+        
+        if not available:
+            return None
+        
+        if self.lb_algorithm == 'round_robin':
+            backend = available[self.current_backend_index % len(available)]
+            self.current_backend_index += 1
+            return backend
+        
+        elif self.lb_algorithm == 'random':
+            return random.choice(available)
+        
+        elif self.lb_algorithm == 'least_connections':
+            # Simplified - would track actual connections in production
+            return random.choice(available)
+        
+        else:
+            return available[0]
+    
+    async def forward_request(self, request: Request, backend: Dict):
+        """Forward request to backend server"""
+        import httpx
+        
+        # Prepare forwarded request
+        headers = dict(request.headers)
+        
+        # Add cloud-specific headers
+        for header, value in self.cloud_headers.items():
+            if callable(value):
+                headers[header] = value()
+            else:
+                headers[header] = value
+        
+        # Add X-Forwarded headers
+        headers["X-Forwarded-For"] = request.client.host
+        headers["X-Forwarded-Host"] = request.headers.get("host", "")
+        headers["X-Forwarded-Proto"] = request.url.scheme
+        
+        # Build backend URL
+        backend_url = f"http://{backend['host']}:{backend['port']}{request.url.path}"
+        if request.url.query:
+            backend_url += f"?{request.url.query}"
+        
+        # Forward request
+        async with httpx.AsyncClient() as client:
+            try:
+                # Get request body
+                body = await request.body()
+                
+                # Forward request
+                response = await client.request(
+                    method=request.method,
+                    url=backend_url,
+                    headers=headers,
+                    content=body,
+                    timeout=30.0
+                )
+                
+                # Return response
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    headers=dict(response.headers)
+                )
+                
+            except Exception as e:
+                logger.error(f"Backend request failed: {e}")
+                # Mark backend as inactive
+                if backend in self.active_backends:
+                    self.active_backends.remove(backend)
+                
+                # Try another backend
+                return await self.forward_request(request, self.select_backend(request))
+    
+    def update_backends(self, new_backends: List[Dict]):
+        """Update backend server list"""
+        self.backend_servers = new_backends
+        # Reset active backends
+        self.active_backends = new_backends.copy()
+        logger.info(f"Updated backends: {len(new_backends)} servers")
+    
+    def start(self, host: str = "0.0.0.0", port: int = 8080):
+        """Start redirector server"""
+        logger.info(f"Starting Cloud Redirector {self.redirector_id} on {host}:{port}")
+        uvicorn.run(self.app, host=host, port=port)
+
+# Configuration for redirector
+redirector_config = {
+    "backend_servers": [
+        {"host": "10.0.100.10", "port": 8443, "weight": 1, "health_check": "/health"},
+        {"host": "10.0.100.11", "port": 8443, "weight": 1, "health_check": "/health"},
+        {"host": "10.0.100.20", "port": 3128, "weight": 2, "health_check": None}
+    ],
+    "cloud_provider": "Cloudflare",
+    "lb_algorithm": "round_robin",
+    "max_connections": 1000,
+    "timeout": 30,
+    "ssl_enabled": True
+}
+
+if __name__ == "__main__":
+    # Create and start redirector
+    redirector = CloudRedirector(
+        redirector_id="redirector-aws-us-east-1",
+        config=redirector_config
+    )
+    redirector.start(port=443)
