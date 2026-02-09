@@ -1,6 +1,6 @@
 # Advanced C2 Infrastructure
 
-Multi-layer Command and Control infrastructure with cloud integration, proxy chains, and advanced evasion techniques.
+Adversary Emulation C2 Framework for Red Team Training & Defensive Validation
 
 ## ⚠️ LEGAL DISCLAIMER
 
