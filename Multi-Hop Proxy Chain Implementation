@@ -1,0 +1,264 @@
+# proxy_chain.py
+"""
+Multi-hop proxy chain for traffic obfuscation
+SOCKS5/HTTP proxies with encryption between hops
+"""
+
+import asyncio
+import socket
+import ssl
+import logging
+from typing import Dict, List, Optional
+import json
+from dataclasses import dataclass
+import hashlib
+from cryptography.fernet import Fernet
+import threading
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ProxyNode:
+    """Proxy node in the chain"""
+    node_id: str
+    host: str
+    port: int
+    proxy_type: str  # socks5, http, https
+    encryption_key: Optional[str] = None
+    next_hop: Optional['ProxyNode'] = None
+    is_active: bool = True
+
+class MultiHopProxyChain:
+    """Manages multi-hop proxy chain"""
+    
+    def __init__(self, chain_id: str, nodes: List[Dict]):
+        self.chain_id = chain_id
+        self.nodes = []
+        self.cipher = None
+        
+        # Build chain from nodes
+        previous = None
+        for i, node_config in enumerate(nodes):
+            node = ProxyNode(
+                node_id=f"{chain_id}-hop{i+1}",
+                host=node_config['host'],
+                port=node_config['port'],
+                proxy_type=node_config.get('type', 'http'),
+                encryption_key=node_config.get('encryption_key')
+            )
+            
+            if previous:
+                previous.next_hop = node
+            
+            self.nodes.append(node)
+            previous = node
+        
+        # Setup encryption if keys provided
+        self._setup_encryption()
+        
+        logger.info(f"Created proxy chain {chain_id} with {len(self.nodes)} hops")
+    
+    def _setup_encryption(self):
+        """Setup encryption between hops"""
+        # Use first node's key or generate new
+        if self.nodes and self.nodes[0].encryption_key:
+            key = self.nodes[0].encryption_key.encode()
+            self.cipher = Fernet(key)
+        else:
+            # Generate shared key for chain
+            key = Fernet.generate_key()
+            self.cipher = Fernet(key)
+            for node in self.nodes:
+                node.encryption_key = key.decode()
+    
+    def encrypt_data(self, data: bytes) -> bytes:
+        """Encrypt data for proxy chain"""
+        if self.cipher:
+            return self.cipher.encrypt(data)
+        return data
+    
+    def decrypt_data(self, encrypted_data: bytes) -> bytes:
+        """Decrypt data from proxy chain"""
+        if self.cipher:
+            return self.cipher.decrypt(encrypted_data)
+        return encrypted_data
+    
+    async def forward_traffic(self, client_data: bytes, client_addr: tuple) -> bytes:
+        """Forward traffic through the entire proxy chain"""
+        current_data = client_data
+        
+        for i, node in enumerate(self.nodes):
+            if not node.is_active:
+                logger.warning(f"Node {node.node_id} inactive, skipping")
+                continue
+            
+            try:
+                # Encrypt data for this hop
+                if i > 0:  # Don't encrypt first hop (client to first proxy)
+                    current_data = self.encrypt_data(current_data)
+                
+                # Connect to next proxy
+                reader, writer = await asyncio.open_connection(
+                    node.host, node.port
+                )
+                
+                # Send data
+                writer.write(current_data)
+                await writer.drain()
+                
+                # Receive response
+                response = await reader.read(4096)
+                
+                # Decrypt if needed
+                if i > 0:
+                    response = self.decrypt_data(response)
+                
+                writer.close()
+                await writer.wait_closed()
+                
+                current_data = response
+                
+                logger.debug(f"Hop {i+1} complete: {node.host}:{node.port}")
+                
+            except Exception as e:
+                logger.error(f"Proxy hop {i+1} failed: {e}")
+                # Try to continue with next node if available
+                if node.next_hop:
+                    continue
+                else:
+                    raise
+        
+        return current_data
+    
+    def get_chain_info(self) -> Dict:
+        """Get information about the proxy chain"""
+        return {
+            "chain_id": self.chain_id,
+            "hop_count": len(self.nodes),
+            "nodes": [
+                {
+                    "node_id": node.node_id,
+                    "host": node.host,
+                    "port": node.port,
+                    "type": node.proxy_type,
+                    "active": node.is_active
+                }
+                for node in self.nodes
+            ],
+            "encryption": "AES-256" if self.cipher else "None",
+            "total_length_km": len(self.nodes) * 100  # Estimated
+        }
+
+class ProxyChainServer:
+    """Server that manages multiple proxy chains"""
+    
+    def __init__(self):
+        self.chains = {}
+        self.active_connections = {}
+        
+        # Example chains
+        self._create_example_chains()
+    
+    def _create_example_chains(self):
+        """Create example proxy chains"""
+        
+        # Chain 1: SOCKS5 chain
+        chain1_nodes = [
+            {"host": "proxy1.example.com", "port": 1080, "type": "socks5"},
+            {"host": "proxy2.example.net", "port": 1080, "type": "socks5"},
+            {"host": "proxy3.example.org", "port": 1080, "type": "socks5"}
+        ]
+        self.add_chain("chain-socks5-01", chain1_nodes)
+        
+        # Chain 2: HTTP/HTTPS mix
+        chain2_nodes = [
+            {"host": "http-proxy1.com", "port": 8080, "type": "http"},
+            {"host": "https-proxy2.com", "port": 8443, "type": "https"},
+            {"host": "http-proxy3.com", "port": 8888, "type": "http"}
+        ]
+        self.add_chain("chain-http-01", chain2_nodes)
+        
+        # Chain 3: Internal only
+        chain3_nodes = [
+            {"host": "10.0.3.10", "port": 3128, "type": "http"},
+            {"host": "10.0.3.20", "port": 9050, "type": "socks5"}
+        ]
+        self.add_chain("chain-internal-01", chain3_nodes)
+    
+    def add_chain(self, chain_id: str, nodes: List[Dict]):
+        """Add a new proxy chain"""
+        chain = MultiHopProxyChain(chain_id, nodes)
+        self.chains[chain_id] = chain
+        logger.info(f"Added proxy chain {chain_id}")
+    
+    def get_chain(self, chain_id: str) -> Optional[MultiHopProxyChain]:
+        """Get proxy chain by ID"""
+        return self.chains.get(chain_id)
+    
+    def get_random_chain(self) -> MultiHopProxyChain:
+        """Get random active chain"""
+        if not self.chains:
+            raise ValueError("No chains available")
+        return random.choice(list(self.chains.values()))
+    
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle client connection through proxy chain"""
+        client_addr = writer.get_extra_info('peername')
+        logger.info(f"New connection from {client_addr}")
+        
+        try:
+            # Read initial data
+            data = await reader.read(1024)
+            
+            # Select proxy chain
+            chain = self.get_random_chain()
+            
+            # Forward through chain
+            response = await chain.forward_traffic(data, client_addr)
+            
+            # Send response back to client
+            writer.write(response)
+            await writer.drain()
+            
+        except Exception as e:
+            logger.error(f"Error handling client {client_addr}: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    
+    async def start_server(self, host: str = "0.0.0.0", port: int = 9999):
+        """Start proxy chain server"""
+        server = await asyncio.start_server(
+            self.handle_client,
+            host, port
+        )
+        
+        logger.info(f"Proxy Chain Server started on {host}:{port}")
+        
+        async with server:
+            await server.serve_forever()
+    
+    def get_status(self) -> Dict:
+        """Get server status"""
+        return {
+            "chains_count": len(self.chains),
+            "active_chains": [c.chain_id for c in self.chains.values()],
+            "total_hops": sum(len(c.nodes) for c in self.chains.values()),
+            "connections": len(self.active_connections)
+        }
+
+# Example usage
+if __name__ == "__main__":
+    import asyncio
+    
+    # Create proxy chain server
+    server = ProxyChainServer()
+    
+    # Print chain info
+    for chain_id, chain in server.chains.items():
+        print(f"\nChain: {chain_id}")
+        print(json.dumps(chain.get_chain_info(), indent=2))
+    
+    # Start server
+    asyncio.run(server.start_server(port=9999))
