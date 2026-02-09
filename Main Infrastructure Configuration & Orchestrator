@@ -1,0 +1,470 @@
+# infrastructure_orchestrator.py
+"""
+C2 Infrastructure Orchestrator with:
+- Multi-layer redirector system
+- DNS infrastructure with domain fronting
+- Proxy chains for traffic obfuscation
+- Cloud-based C2 servers
+- Encrypted communication channels
+"""
+
+import asyncio
+import json
+import logging
+import random
+import threading
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+import yaml
+from dataclasses import dataclass, field
+import hashlib
+import socket
+import ipaddress
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class InfrastructureConfig:
+    """Infrastructure configuration"""
+    # Cloud Providers
+    cloud_providers: List[str] = field(default_factory=lambda: ['AWS', 'Azure', 'Google', 'Cloudflare'])
+    
+    # DNS Configuration
+    dns_providers: List[str] = field(default_factory=lambda: ['Cloudflare', 'AWS Route53', 'Azure DNS'])
+    dga_enabled: bool = True
+    dga_seed: str = "corporate-network-2024"
+    
+    # Redirector Configuration
+    redirector_count: int = 3
+    redirector_rotation_interval: int = 300  # seconds
+    
+    # Proxy Chain Configuration
+    proxy_chain_depth: int = 2  # Number of proxy hops
+    proxy_types: List[str] = field(default_factory=lambda: ['socks5', 'http', 'https'])
+    
+    # C2 Server Configuration
+    c2_servers_count: int = 2
+    c2_networks: List[str] = field(default_factory=lambda: ['10.0.0.0/16', '192.168.100.0/24'])
+    
+    # Implant Configuration
+    beacon_interval: Tuple[int, int] = (30, 90)  # Min, Max seconds
+    jitter_percentage: float = 0.3
+
+@dataclass
+class NetworkNode:
+    """Base network node"""
+    node_id: str
+    node_type: str  # redirector, proxy, c2, dns
+    ip_address: str
+    port: int
+    cloud_provider: Optional[str] = None
+    region: Optional[str] = None
+    tags: Dict = field(default_factory=dict)
+    is_active: bool = True
+    last_seen: datetime = field(default_factory=datetime.now)
+
+class C2InfrastructureOrchestrator:
+    """Orchestrates the complete C2 infrastructure"""
+    
+    def __init__(self, config: Optional[InfrastructureConfig] = None):
+        self.config = config or InfrastructureConfig()
+        self.nodes = {}
+        self.routing_table = {}
+        self.dns_records = {}
+        self.proxy_chains = []
+        self.running = False
+        
+        # Initialize components
+        self._init_dns_infrastructure()
+        self._init_redirectors()
+        self._init_proxy_chains()
+        self._init_c2_servers()
+        
+    def _init_dns_infrastructure(self):
+        """Initialize DNS infrastructure with multiple providers"""
+        logger.info("Initializing DNS infrastructure...")
+        
+        # Primary DNS server
+        primary_dns = NetworkNode(
+            node_id="dns-primary-01",
+            node_type="dns",
+            ip_address="10.0.1.10",
+            port=53,
+            cloud_provider="Cloudflare",
+            region="global",
+            tags={"role": "primary", "provider": "cloudflare"}
+        )
+        self.nodes[primary_dns.node_id] = primary_dns
+        
+        # Secondary DNS servers
+        secondary_dns = NetworkNode(
+            node_id="dns-secondary-01",
+            node_type="dns",
+            ip_address="10.0.1.11",
+            port=53,
+            cloud_provider="AWS Route53",
+            region="us-east-1",
+            tags={"role": "secondary", "provider": "route53"}
+        )
+        self.nodes[secondary_dns.node_id] = secondary_dns
+        
+        # Generate DGA domains if enabled
+        if self.config.dga_enabled:
+            self._generate_dga_domains()
+    
+    def _generate_dga_domains(self):
+        """Generate Domain Generation Algorithm domains"""
+        logger.info("Generating DGA domains...")
+        
+        base_date = datetime.now()
+        domains = []
+        
+        for i in range(7):  # Generate for next 7 days
+            date = base_date + timedelta(days=i)
+            date_str = date.strftime("%Y%m%d")
+            
+            # Deterministic domain generation
+            seed = f"{self.config.dga_seed}{date_str}"
+            hash_digest = hashlib.md5(seed.encode()).hexdigest()
+            
+            # Create domain
+            domain_name = hash_digest[:12]
+            tlds = ['.com', '.net', '.org', '.info']
+            tld = tlds[int(hash_digest[12:14], 16) % len(tlds)]
+            
+            domain = f"{domain_name}{tld}"
+            domains.append(domain)
+            
+            # Store DNS record
+            self.dns_records[domain] = {
+                "created": date,
+                "active": True,
+                "ips": [],
+                "cname": None
+            }
+        
+        logger.info(f"Generated {len(domains)} DGA domains")
+        return domains
+    
+    def _init_redirectors(self):
+        """Initialize redirector/load balancer layer"""
+        logger.info("Initializing redirector layer...")
+        
+        for i in range(self.config.redirector_count):
+            redirector = NetworkNode(
+                node_id=f"redirector-{i+1:02d}",
+                node_type="redirector",
+                ip_address=f"10.0.2.{10 + i}",
+                port=443,
+                cloud_provider=random.choice(self.config.cloud_providers),
+                region=random.choice(['us-east-1', 'eu-west-1', 'ap-southeast-1']),
+                tags={
+                    "role": "load_balancer",
+                    "rotation_group": i % 2,
+                    "ssl": True
+                }
+            )
+            self.nodes[redirector.node_id] = redirector
+    
+    def _init_proxy_chains(self):
+        """Initialize proxy chains for traffic obfuscation"""
+        logger.info("Initializing proxy chains...")
+        
+        for chain_id in range(3):  # Create 3 different proxy chains
+            chain = []
+            
+            for hop in range(self.config.proxy_chain_depth):
+                proxy = NetworkNode(
+                    node_id=f"proxy-chain{chain_id+1}-hop{hop+1}",
+                    node_type="proxy",
+                    ip_address=f"10.0.3.{10 + chain_id * 10 + hop}",
+                    port=random.choice([8080, 8888, 3128, 9050]),
+                    cloud_provider=random.choice(['DigitalOcean', 'Vultr', 'Linode']),
+                    region="global",
+                    tags={
+                        "proxy_type": random.choice(self.config.proxy_types),
+                        "chain_id": chain_id,
+                        "hop": hop,
+                        "encryption": True
+                    }
+                )
+                self.nodes[proxy.node_id] = proxy
+                chain.append(proxy)
+            
+            self.proxy_chains.append(chain)
+            logger.info(f"Created proxy chain {chain_id+1} with {len(chain)} hops")
+    
+    def _init_c2_servers(self):
+        """Initialize C2 servers in internal network"""
+        logger.info("Initializing C2 servers...")
+        
+        # Main C2 server (FastAPI)
+        c2_main = NetworkNode(
+            node_id="c2-main-01",
+            node_type="c2",
+            ip_address="10.0.100.10",
+            port=8443,
+            cloud_provider="AWS",
+            region="us-east-1",
+            tags={
+                "role": "primary",
+                "framework": "FastAPI",
+                "internal_only": True,
+                "teamserver": True
+            }
+        )
+        self.nodes[c2_main.node_id] = c2_main
+        
+        # Secondary C2 server for redundancy
+        c2_backup = NetworkNode(
+            node_id="c2-backup-01",
+            node_type="c2",
+            ip_address="10.0.100.11",
+            port=8443,
+            cloud_provider="Azure",
+            region="westeurope",
+            tags={
+                "role": "backup",
+                "framework": "Custom",
+                "internal_only": True
+            }
+        )
+        self.nodes[c2_backup.node_id] = c2_backup
+        
+        # Internal proxy for C2 communication
+        internal_proxy = NetworkNode(
+            node_id="internal-proxy-01",
+            node_type="internal_proxy",
+            ip_address="10.0.100.20",
+            port=3128,
+            cloud_provider=None,
+            region=None,
+            tags={
+                "role": "internal_router",
+                "protocol": "socks5",
+                "auth": True
+            }
+        )
+        self.nodes[internal_proxy.node_id] = internal_proxy
+    
+    def get_route_for_implant(self, implant_id: str) -> Dict:
+        """Get complete route for an implant including proxies and redirectors"""
+        # Select random proxy chain
+        chain = random.choice(self.proxy_chains)
+        
+        # Select active redirector
+        redirectors = [n for n in self.nodes.values() 
+                      if n.node_type == "redirector" and n.is_active]
+        redirector = random.choice(redirectors) if redirectors else None
+        
+        # Get C2 server
+        c2_servers = [n for n in self.nodes.values() 
+                     if n.node_type == "c2" and n.is_active]
+        c2_server = random.choice(c2_servers) if c2_servers else None
+        
+        # Get DGA domain
+        active_domains = [d for d, info in self.dns_records.items() 
+                         if info.get("active", False)]
+        domain = random.choice(active_domains) if active_domains else "c2.example.com"
+        
+        route = {
+            "implant_id": implant_id,
+            "timestamp": datetime.now().isoformat(),
+            "domain": domain,
+            "dns_server": "10.0.1.10",
+            "proxy_chain": [
+                {
+                    "host": proxy.ip_address,
+                    "port": proxy.port,
+                    "type": proxy.tags.get("proxy_type", "http")
+                }
+                for proxy in chain
+            ],
+            "redirector": {
+                "host": redirector.ip_address if redirector else None,
+                "port": redirector.port if redirector else None
+            },
+            "c2_server": {
+                "host": c2_server.ip_address if c2_server else None,
+                "port": c2_server.port if c2_server else None,
+                "internal_proxy": "10.0.100.20:3128"
+            },
+            "encryption": {
+                "algorithm": "AES-256-GCM",
+                "key_exchange": "ECDH",
+                "signature": "ECDSA"
+            },
+            "beacon_config": {
+                "interval": random.randint(*self.config.beacon_interval),
+                "jitter": self.config.jitter_percentage,
+                "protocol": random.choice(['https', 'dns', 'icmp'])
+            }
+        }
+        
+        # Store route for this implant
+        self.routing_table[implant_id] = {
+            "route": route,
+            "last_used": datetime.now(),
+            "usage_count": 0
+        }
+        
+        return route
+    
+    def rotate_infrastructure(self):
+        """Rotate infrastructure components for OPSEC"""
+        logger.info("Rotating infrastructure components...")
+        
+        # Rotate redirector IPs
+        redirectors = [n for n in self.nodes.values() 
+                      if n.node_type == "redirector"]
+        for redirector in redirectors:
+            if random.random() < 0.3:  # 30% chance to rotate each redirector
+                # Simulate IP change
+                old_ip = redirector.ip_address
+                redirector.ip_address = f"10.0.2.{random.randint(20, 50)}"
+                redirector.last_seen = datetime.now()
+                logger.info(f"Rotated redirector {redirector.node_id}: {old_ip} -> {redirector.ip_address}")
+        
+        # Update DNS records
+        for domain, record in self.dns_records.items():
+            if record.get("active", False):
+                # Add new IP to DNS record
+                new_ip = f"10.0.2.{random.randint(100, 200)}"
+                if "ips" not in record:
+                    record["ips"] = []
+                record["ips"].append(new_ip)
+                
+                # Keep only last 3 IPs
+                if len(record["ips"]) > 3:
+                    record["ips"] = record["ips"][-3:]
+        
+        # Rotate proxy chains
+        for chain in self.proxy_chains:
+            if random.random() < 0.2:  # 20% chance to rotate entire chain
+                random.shuffle(chain)
+        
+        logger.info("Infrastructure rotation completed")
+    
+    def simulate_traffic_flow(self, implant_id: str, action: str = "beacon") -> List[str]:
+        """Simulate traffic flow through infrastructure"""
+        flow = []
+        
+        # Get route for implant
+        route = self.routing_table.get(implant_id, {}).get("route", {})
+        if not route:
+            route = self.get_route_for_implant(implant_id)
+        
+        # Simulate flow
+        flow.append(f"[{datetime.now().strftime('%H:%M:%S')}] Implant {implant_id[:8]}... → DNS Query for {route['domain']}")
+        flow.append(f"  ├─ DNS ({route['dns_server']}) resolves to Redirector")
+        
+        # Through proxy chain
+        for i, proxy in enumerate(route['proxy_chain']):
+            flow.append(f"  ├─ Proxy Hop {i+1}: {proxy['type']}://{proxy['host']}:{proxy['port']}")
+        
+        # Through redirector
+        if route['redirector']['host']:
+            flow.append(f"  ├─ Redirector: {route['redirector']['host']}:{route['redirector']['port']}")
+        
+        # Internal proxy
+        flow.append(f"  ├─ Internal Proxy: {route['c2_server']['internal_proxy']}")
+        
+        # To C2 server
+        flow.append(f"  └─ C2 Server: {route['c2_server']['host']}:{route['c2_server']['port']}")
+        
+        # Return path
+        flow.append(f"[{datetime.now().strftime('%H:%M:%S')}] Response ← Reverse Path")
+        
+        return flow
+    
+    def get_infrastructure_status(self) -> Dict:
+        """Get current infrastructure status"""
+        status = {
+            "timestamp": datetime.now().isoformat(),
+            "nodes": {
+                node_type: len([n for n in self.nodes.values() if n.node_type == node_type])
+                for node_type in ['redirector', 'proxy', 'c2', 'dns', 'internal_proxy']
+            },
+            "active_implant_routes": len(self.routing_table),
+            "dga_domains_active": len([d for d, info in self.dns_records.items() if info.get("active", False)]),
+            "proxy_chains": len(self.proxy_chains),
+            "rotation_schedule": f"Every {self.config.redirector_rotation_interval} seconds"
+        }
+        
+        return status
+    
+    def start_monitoring(self):
+        """Start infrastructure monitoring and rotation"""
+        self.running = True
+        
+        def monitor_loop():
+            while self.running:
+                # Check node health
+                for node in self.nodes.values():
+                    # Simulate health check
+                    node.is_active = random.random() > 0.05  # 95% uptime
+                
+                # Rotate infrastructure periodically
+                current_time = time.time()
+                if current_time % self.config.redirector_rotation_interval < 1:
+                    self.rotate_infrastructure()
+                
+                time.sleep(1)
+        
+        self.monitor_thread = threading.Thread(target=monitor_loop)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+        logger.info("Infrastructure monitoring started")
+    
+    def stop(self):
+        """Stop infrastructure"""
+        self.running = False
+        logger.info("Infrastructure stopped")
+
+# Example usage
+if __name__ == "__main__":
+    # Create orchestrator
+    config = InfrastructureConfig(
+        redirector_count=4,
+        proxy_chain_depth=3,
+        c2_servers_count=2
+    )
+    
+    orchestrator = C2InfrastructureOrchestrator(config)
+    
+    # Start monitoring
+    orchestrator.start_monitoring()
+    
+    try:
+        # Simulate some implants
+        implants = [f"implant-{i:04d}" for i in range(5)]
+        
+        for implant in implants:
+            route = orchestrator.get_route_for_implant(implant)
+            print(f"\nRoute for {implant}:")
+            print(json.dumps(route, indent=2))
+            
+            # Simulate traffic flow
+            flow = orchestrator.simulate_traffic_flow(implant)
+            print(f"\nTraffic Flow:")
+            for line in flow:
+                print(line)
+            
+            time.sleep(1)
+        
+        # Show status
+        print(f"\nInfrastructure Status:")
+        print(json.dumps(orchestrator.get_infrastructure_status(), indent=2))
+        
+        # Keep running
+        while True:
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        orchestrator.stop()
+        print("\nInfrastructure shutdown complete")
