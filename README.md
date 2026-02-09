@@ -15,3 +15,44 @@ This infrastructure is designed for:
 **NEVER** deploy this infrastructure against systems you do not own or have explicit written permission to test.
 
 ## Architecture Overview
+
+┌─────────────────────────────────────────────────────────────┐
+│ PUBLIC INTERNET │
+└──────────────────────────┬──────────────────────────────────┘
+│
+[ DNS Queries ]
+│
+┌──────────────────────────▼──────────────────────────────────┐
+│ CLOUD DNS INFRASTRUCTURE │
+│ • Domain Generation Algorithm (DGA) │
+│ • Fast-Flux DNS │
+│ • Domain Fronting (Cloudflare, AWS, etc.) │
+└──────────────────────────┬──────────────────────────────────┘
+│
+[ HTTP/S Traffic ]
+│
+┌──────────────────────────▼──────────────────────────────────┐
+│ MULTI-CLOUD REDIRECTOR LAYER │
+│ • Load Balancing │
+│ • IP Rotation │
+│ • Geo-distribution │
+└──────────────────────────┬──────────────────────────────────┘
+│
+[ Proxy Chain Routing ]
+│
+┌──────────────────────────▼──────────────────────────────────┐
+│ MULTI-HOP PROXY CHAINS │
+│ • SOCKS5/HTTP/HTTPS proxies │
+│ • Traffic encryption between hops │
+│ • Obfuscation layers │
+└──────────────────────────┬──────────────────────────────────┘
+│
+[ Internal Network ]
+│
+┌──────────────────────────▼──────────────────────────────────┐
+│ INTERNAL C2 INFRASTRUCTURE │
+│ • TeamServer with Web UI │
+│ • Agent management │
+│ • Task orchestration │
+│ • Campaign tracking │
+└─────────────────────────────────────────────────────────────┘
