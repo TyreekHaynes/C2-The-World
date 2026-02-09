@@ -1,0 +1,245 @@
+# infrastructure_config.yaml
+infrastructure:
+  name: "Advanced C2 Infrastructure v2.0"
+  environment: "redteam-lab"
+  description: "Multi-layer C2 with cloud integration"
+  version: "2.0.0"
+  deployment_date: "2024-01-15"
+  
+  cloud_providers:
+    - AWS
+    - Azure
+    - Google Cloud
+    - Cloudflare
+    - DigitalOcean
+  
+  regions:
+    primary: "us-east-1"
+    secondary: "eu-west-1"
+    tertiary: "ap-southeast-1"
+  
+  network_config:
+    vpc_cidr: "10.0.0.0/16"
+    subnet_public: "10.0.1.0/24"
+    subnet_private: "10.0.100.0/24"
+    subnet_isolated: "10.0.200.0/24"
+    
+components:
+  redirectors:
+    count: 4
+    configuration:
+      - id: "redirector-aws-01"
+        type: "load_balancer"
+        cloud: "AWS"
+        region: "us-east-1"
+        port: 443
+        ssl: true
+        algorithm: "round_robin"
+      
+      - id: "redirector-cloudflare-01"
+        type: "reverse_proxy"
+        cloud: "Cloudflare"
+        region: "global"
+        port: 443
+        ssl: true
+        algorithm: "random"
+      
+      - id: "redirector-azure-01"
+        type: "application_gateway"
+        cloud: "Azure"
+        region: "westeurope"
+        port: 8443
+        ssl: true
+        algorithm: "least_connections"
+      
+      - id: "redirector-internal-01"
+        type: "nginx"
+        cloud: "Internal"
+        region: "lab"
+        port: 9443
+        ssl: true
+        algorithm: "ip_hash"
+  
+  dns_infrastructure:
+    primary: "10.0.1.10"
+    secondary: "10.0.1.11"
+    
+    features:
+      dga_enabled: true
+      dga_seed: "corporate-redteam-2024"
+      fast_flux: true
+      domain_fronting: true
+      dns_over_https: true
+      dns_over_tls: true
+    
+    domains:
+      - "*.c2corp[.]net"
+      - "*.cdnassets[.]com"
+      - "*.staticcloud[.]org"
+    
+    ttl_config:
+      normal: 300
+      fast_flux: 60
+      dga: 120
+  
+  proxy_chains:
+    count: 3
+    
+    chains:
+      - id: "chain-socks5-01"
+        hops:
+          - type: "socks5"
+            host: "proxy1.c2corp.net"
+            port: 1080
+            encryption: "AES-256"
+          
+          - type: "socks5"
+            host: "proxy2.c2corp.net"
+            port: 1080
+            encryption: "AES-256"
+          
+          - type: "socks5"
+            host: "proxy3.c2corp.net"
+            port: 1080
+            encryption: "AES-256"
+      
+      - id: "chain-http-mix-01"
+        hops:
+          - type: "http"
+            host: "http-proxy1.com"
+            port: 8080
+            encryption: "TLS"
+          
+          - type: "https"
+            host: "https-proxy2.net"
+            port: 8443
+            encryption: "TLS"
+          
+          - type: "http"
+            host: "http-proxy3.org"
+            port: 8888
+            encryption: "AES-256"
+      
+      - id: "chain-internal-01"
+        hops:
+          - type: "http"
+            host: "10.0.3.10"
+            port: 3128
+            encryption: "TLS"
+          
+          - type: "socks5"
+            host: "10.0.3.20"
+            port: 9050
+            encryption: "AES-256"
+  
+  c2_servers:
+    count: 2
+    
+    servers:
+      - id: "c2-primary-01"
+        type: "teamserver"
+        framework: "FastAPI"
+        host: "10.0.100.10"
+        port: 8443
+        ssl: true
+        database: "postgresql"
+        features: ["real-time", "multi-operator", "campaigns"]
+      
+      - id: "c2-backup-01"
+        type: "listener"
+        framework: "Custom"
+        host: "10.0.100.11"
+        port: 9443
+        ssl: true
+        database: "sqlite"
+        features: ["high-availability", "fallback"]
+    
+    internal_proxy:
+      host: "10.0.100.20"
+      port: 3128
+      type: "socks5"
+      authentication: true
+  
+  implants:
+    beacon_interval:
+      min: 30
+      max: 90
+      jitter: 0.3
+    
+    protocols:
+      - "HTTPS"
+      - "DNS"
+      - "ICMP"
+      - "WebSocket"
+    
+    encryption:
+      algorithm: "AES-256-GCM"
+      key_exchange: "ECDH"
+      signature: "ECDSA"
+
+security:
+  encryption:
+    transport: "TLS 1.3"
+    payload: "AES-256-GCM"
+    key_rotation: "daily"
+  
+  authentication:
+    agents: "HMAC-SHA256"
+    operators: "JWT"
+    api_keys: true
+  
+  network:
+    ip_whitelisting: true
+    rate_limiting: true
+    geo_blocking: false
+    threat_intel_feeds: true
+  
+  logging:
+    enabled: true
+    level: "INFO"
+    retention_days: 30
+    encryption: true
+
+monitoring:
+  enabled: true
+  
+  dashboard:
+    enabled: true
+    port: 3000
+    authentication: true
+    real_time_updates: true
+  
+  metrics:
+    - "agent_connections"
+    - "task_completion_rate"
+    - "infrastructure_health"
+    - "traffic_volume"
+    - "security_events"
+  
+  alerting:
+    email: true
+    webhook: true
+    thresholds:
+      high_cpu: 80
+      high_memory: 85
+      agent_disconnect: 300
+      failed_logins: 5
+
+maintenance:
+  rotation_schedule:
+    dns_ips: "every 5 minutes"
+    proxy_chains: "every 12 hours"
+    encryption_keys: "daily"
+    certificates: "monthly"
+  
+  backup:
+    enabled: true
+    schedule: "daily"
+    retention: "7 days"
+    encryption: true
+
+compliance:
+  data_retention: 30
+  access_logging: true
+  audit_trail: true
+  authorized_use_only: true
