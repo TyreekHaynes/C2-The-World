@@ -6,6 +6,9 @@ Adversary Emulation C2 Framework for Red Team Training & Defensive Validation
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![AWS](https://img.shields.io/badge/AWS-%23FF9900.svg?logo=amazon-aws&logoColor=white)](https://aws.amazon.com)
 [![Cloudflare](https://img.shields.io/badge/Cloudflare-F38020?logo=Cloudflare&logoColor=white)](https://cloudflare.com)
+![Python](https://img.shields.io/badge/python-3.9+-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
 
 ## LEGAL DISCLAIMER
 
