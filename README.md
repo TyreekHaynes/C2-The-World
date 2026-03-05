@@ -2,7 +2,12 @@
 
 Adversary Emulation C2 Framework for Red Team Training & Defensive Validation
 
-## ⚠️ LEGAL DISCLAIMER
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![AWS](https://img.shields.io/badge/AWS-%23FF9900.svg?logo=amazon-aws&logoColor=white)](https://aws.amazon.com)
+[![Cloudflare](https://img.shields.io/badge/Cloudflare-F38020?logo=Cloudflare&logoColor=white)](https://cloudflare.com)
+
+## LEGAL DISCLAIMER
 
 **FOR AUTHORIZED SECURITY TESTING AND EDUCATIONAL PURPOSES ONLY**
 
@@ -15,7 +20,6 @@ This infrastructure is designed for:
 **NEVER** deploy this infrastructure against systems you do not own or have explicit written permission to test.
 
 ## Architecture Overview
-
 ┌─────────────────────────────────────────────────────────────┐
 │ PUBLIC INTERNET │
 └──────────────────────────┬──────────────────────────────────┘
@@ -24,104 +28,42 @@ This infrastructure is designed for:
 │
 ┌──────────────────────────▼──────────────────────────────────┐
 │ CLOUD DNS INFRASTRUCTURE │
-│ • Domain Generation Algorithm (DGA) │
-│ • Fast-Flux DNS │
-│ • Domain Fronting (Cloudflare, AWS, etc.) │
+│ (Cloudflare) │
+│ • Domain: assets-delivery.org │
+│ • DDoS Protection │
+│ • SSL/TLS Termination │
 └──────────────────────────┬──────────────────────────────────┘
 │
-[ HTTP/S Traffic ]
+[ HTTPS Traffic ]
 │
 ┌──────────────────────────▼──────────────────────────────────┐
-│ MULTI-CLOUD REDIRECTOR LAYER │
-│ • Load Balancing │
-│ • IP Rotation │
-│ • Geo-distribution │
-└──────────────────────────┬──────────────────────────────────┘
-│
-[ Proxy Chain Routing ]
-│
-┌──────────────────────────▼──────────────────────────────────┐
-│ MULTI-HOP PROXY CHAINS │
-│ • SOCKS5/HTTP/HTTPS proxies │
-│ • Traffic encryption between hops │
-│ • Obfuscation layers │
+│ REDIRECTOR LAYER │
+│ (Nginx - AWS) │
+│ • Public Subnet │
+│ • Elastic IP: 3.150.196.7 │
+│ • SSL Termination │
+│ • Request Forwarding │
 └──────────────────────────┬──────────────────────────────────┘
 │
 [ Internal Network ]
 │
 ┌──────────────────────────▼──────────────────────────────────┐
-│ INTERNAL C2 INFRASTRUCTURE │
-│ • TeamServer with Web UI │
-│ • Agent management │
-│ • Task orchestration │
-│ • Campaign tracking │
+│ C2 TEAMSERVER │
+│ (FastAPI - AWS) │
+│ • Private Subnet │
+│ • No Public IP │
+│ • Agent Management │
+│ • Task Orchestration │
+│ • Encrypted Communications │
+└──────────────────────────┬──────────────────────────────────┘
+│
+[ Agent Tasks ]
+│
+┌──────────────────────────▼──────────────────────────────────┐
+│ AGENTS │
+│ (Windows/Linux/macOS Targets) │
+│ • Python-based implants │
+│ • Encrypted C2 communications │
+│ • Module-based architecture │
+│ • Persistence mechanisms │
 └─────────────────────────────────────────────────────────────┘
-
-
-
-
-## Features
-
-### 1. **DNS Infrastructure**
-- Domain Generation Algorithm (DGA)
-- Fast-Flux DNS with IP rotation
-- Domain fronting with legitimate CDNs
-- DNS-over-HTTPS/TLS support
-
-### 2. **Redirector Layer**
-- Multi-cloud deployment (AWS, Azure, Cloudflare)
-- Load balancing algorithms
-- SSL termination
-- IP whitelisting/blacklisting
-
-### 3. **Proxy Chains**
-- Multi-hop traffic routing
-- SOCKS5/HTTP/HTTPS support
-- Inter-hop encryption
-- Automatic chain rotation
-
-### 4. **C2 TeamServer**
-- Real-time WebSocket updates
-- Multi-operator collaboration
-- Campaign management
-- Encrypted agent communication
-- Task scheduling and automation
-
-### 5. **Security Features**
-- End-to-end encryption (AES-256-GCM)
-- JWT authentication for operators
-- Rate limiting and IP filtering
-- Comprehensive logging and auditing
-- Automated certificate management
-
-## Deployment
-
-### Prerequisites
-- Python 3.9+
-- OpenSSL for certificate generation
-- Network access to configured cloud providers
-
-### Quick Start
-
-1. **Clone and install dependencies:**
-
-git clone <repository>
-cd advanced-c2-infrastructure
-pip install -r requirements.txt
-Generate SSL certificates:
-
-
-python deploy_infrastructure.py --generate-certs
-Deploy complete infrastructure:
-
-
-python deploy_infrastructure.py
-Access components:
-
-Infrastructure Dashboard: http://localhost:8000
-
-Redirector 1: https://localhost:443
-
-C2 TeamServer: https://localhost:8443
-
-DNS Server: UDP port 53
