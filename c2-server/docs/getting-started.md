@@ -1,27 +1,19 @@
-# Getting Started with C2 Framework
-
-## Quick Start (5 minutes)
-
-### Prerequisites
-- Docker and Docker Compose
-- Python 3.9+ (for agent development)
-- Git
-
-### Option 1: Docker Deployment (Easiest)
-
-
-# Clone the repository
 git clone https://github.com/TyreekHaynes/c2-framework.git
 cd c2-framework
 
-# Generate a master key
-export C2_MASTER_KEY=$(python -c "from cryptography.fernet import Fernet; import base64; print(base64.b64encode(Fernet.generate_key()).decode())")
+Deploy with Docker:
 
-# Start everything
+
+cd c2-server
 docker-compose up -d
+Configure the server:
 
-# Check status
-docker-compose ps
 
-# View logs
-docker-compose logs -f
+python c2-server/config.py  # Generate configs
+
+cat c2-server/docs/getting-started.md  # Learn how to use it
+
+Deploy agents:
+
+cd agent
+python agent.py --server http://your-c2-server:8443
