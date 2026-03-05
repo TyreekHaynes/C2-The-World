@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  c2-server:
+    build: ./c2-server
+    container_name: c2-server
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    environment:
+      - C2_HOST=0.0.0.0
+      - C2_PORT=8443
+      - C2_WORKERS=4
+      - C2_DB_PATH=/app/data/c2.db
+      - LOG_LEVEL=INFO
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - C2_MASTER_KEY=${C2_MASTER_KEY}
+    volumes:
+      - c2-data:/app/data
+    networks:
+      - c2-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8443/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  redirector:
+    build: ./redirector
+    container_name: redirector
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      c2-server:
+        condition: service_healthy
+    environment:
+      - C2_SERVER_URL=http://c2-server:8443
+      - DOMAIN=${DOMAIN:-localhost}
+      - SSL_MODE=${SSL_MODE:-selfsigned}
+    volumes:
+      - ./redirector/ssl:/etc/nginx/ssl
+    networks:
+      - c2-network
+
+  web-dashboard:
+    build: ./web-dashboard
+    container_name: dashboard
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      - c2-server
+    environment:
+      - C2_API_URL=http://c2-server:8443
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+    networks:
+      - c2-network
+
+networks:
+  c2-network:
+    driver: bridge
+
+volumes:
+  c2-data:
