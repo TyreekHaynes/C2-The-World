@@ -1,5 +1,5 @@
-git clone https://github.com/TyreekHaynes/c2-framework.git
-cd c2-framework
+git clone https://github.com/TyreekHaynes/C2-The-World
+cd cd C2-The-World
 
 Deploy with Docker:
 
