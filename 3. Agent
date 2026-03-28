@@ -331,7 +331,7 @@ def beacon(agent_key_str):
 def main():
     print("""
     ╔══════════════════════════════════╗
-    ║     C2 Agent - InternalC2Server  ║
+    ║   C2 Agent - InternalC2Server    ║
     ╚══════════════════════════════════╝
     """)
 
