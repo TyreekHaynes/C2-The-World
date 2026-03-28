@@ -72,30 +72,3 @@ This infrastructure is designed for:
 │  • Module-based architecture                                 │
 │  • Persistence mechanisms                                    │
 └─────────────────────────────────────────────────────────────┘
-
-
-[Agent] ─────────────────────────────────────────────────────┐
-   │                                                          │
-   │ 1. Agent makes HTTPS request to assets-delivery.org     │
-   ▼                                                          │
-[Cloudflare]                                                  │
-   │                                                          │
-   │ 2. Cloudflare terminates SSL, forwards to redirector    │
-   ▼                                                          │
-[Redirector] (3.150.196.7)                                    │
-   │                                                          │
-   │ 3. Nginx proxies request to internal C2 server          │
-   ▼                                                          │
-[Internal Network]                                            │
-   │                                                          │
-   │ 4. Request reaches C2 server at 10.0.146.28:8443       │
-   ▼                                                          │
-[C2 TeamServer]                                               │
-   │                                                          │
-   │ 5. C2 processes beacon, checks for tasks                │
-   │                                                          │
-   │ 6. Response flows back through same path                │
-   ▼                                                          │
-[Agent] receives tasks, executes, sends results              │
-   │                                                          │
-   └──────────────────────────────────────────────────────────┘
