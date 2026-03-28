@@ -121,7 +121,7 @@ class InternalC2Server:
                 asyncio.create_task(self._cleanup_old_tasks_loop())
             ]
 
-            logger.info(f"🔐 Master key: {base64.b64encode(self.master_key).decode()}")
+            logger.info(f"Master key: {base64.b64encode(self.master_key).decode()}")
             logger.info("Startup complete")
 
         @self.app.on_event("shutdown")
